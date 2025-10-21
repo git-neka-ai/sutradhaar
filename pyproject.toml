@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sutradhar"
+version = "0.1.0"
+description = "Python code editor"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+# CLI entry points (optional; add one per module bootstrap)
+[project.scripts]
+sutradhar = "sutradhar.main:main"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+fix = true
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "I", "N"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["sutradhar"]
+combine-as-imports = true
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+no_implicit_reexport = true
+disallow_untyped_defs = true
+warn_unused_ignores = true
+mypy_path = ["src"]
+
+[tool.importlinter]
+root_package = "."
+
+# Example: layered architecture (shared <- alpha <- beta)
+[[tool.importlinter.contracts]]
+name = "Layered modules"
+type = "layers"
+layers = ["sutradhar"]
+
+# Example: forbid cross-module internal imports
+[[tool.importlinter.contracts]]
+name = "No internal leakage"
+type = "forbidden"
+source_modules = ["sutradhar"]
+forbidden_modules = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
