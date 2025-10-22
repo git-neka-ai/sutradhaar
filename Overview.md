@@ -1,252 +1,239 @@
-<!-- orion: Adding a top-level project overview to provide a shared mental model of architecture, workflows, configuration, and operations. Includes Mermaid diagrams (component map, flowcharts, sequence diagrams) as requested to make critical paths and responsibilities explicit. -->
+<!-- orion: Adding a comprehensive repository overview with architecture, processes, data contracts, configuration, and Mermaid diagrams to guide contributors and tools. This fulfills the request to populate Overview.md with a clear end-to-end description and visualizations. -->
+# Repository Overview
 
-# Project Overview
+This document explains the system architecture, core components, interaction flows, data contracts, configuration knobs, and safety constraints for this repository. It also embeds Mermaid diagrams to visualize conversation, apply, and summarization processes.
 
-This document provides a concise, system-wide overview to help engineers, SREs, product, and stakeholders understand how the application is structured, how requests flow, where state lives, and how to configure and operate the system across environments.
 
-Scope
-- High-level architecture and responsibilities
-- Core workflows (synchronous requests, background jobs, CI/CD)
-- Configuration and environment management
-- Observability, reliability, and security considerations
-- Pointers for local development and extension
+<!-- orion: Providing a concise purpose section to orient readers quickly and establish scope. -->
+## Purpose and Scope
+- Describe how the assistant processes change specifications and repository contents to produce precise JSON patches.
+- Clarify the roles of tools (functions namespace) and the multi_tool_use wrapper for parallel calls.
+- Document the strict output contract and the requirement to include `orion:` rationale comments in code changes.
+- Visualize the system with Mermaid diagrams for faster comprehension.
 
-Note: This is a reference architecture template. Adapt names and components to match the actual services in this repository.
 
-## 1) High-level Architecture
+<!-- orion: Detailing the system architecture and responsibilities helps maintainers and tool users understand where logic runs and how data flows. -->
+## System Architecture
+### Key Components
+- Orion Apply Assistant
+  - Reads change specs and current file contents.
+  - Optionally calls tools to gather more context.
+  - Produces a strict JSON response: mode, explanation, files (patches), and issues.
+  - Inserts explanatory comments beginning with `orion:` just before each change made to files.
+- Tooling Layer (functions namespace)
+  - list_paths: Enumerate repo files (optionally by glob).
+  - get_file_contents: Retrieve full file contents.
+  - get_file_snippet: Retrieve line-ranged snippets.
+  - search_code: Search for substrings across files.
+  - ask_user: Request clarifications when requirements are ambiguous or missing.
+  - list_project_descriptions: List external Project Descriptions (PDs).
+  - get_project_orion_summary: Retrieve a Project Orion Summary (POS) for a PD.
+- Multi-tool wrapper
+  - multi_tool_use.parallel: Execute multiple tool calls concurrently when safe, improving latency.
+- Host Application
+  - Invokes the assistant and applies returned patches to the local repository.
+  - Renders or post-processes the assistant’s JSON response.
+- Target Repository (Local File System)
+  - Contains the code and docs to be modified.
+  - Receives updated files with `orion:` rationale comments embedded.
 
-Purpose: Identify major components, their roles, and boundaries.
 
+<!-- orion: Including a high-level architecture flowchart to visualize actors, tools, and data stores at a glance. -->
+### Architecture Diagram
 ```mermaid
-graph TB
-  subgraph Client
-    Browser[Web/Mobile Client]
+flowchart LR
+  U[User / Requestor] -->|Change Specs + Files| OA[Orion Apply]
+  subgraph Tools[functions.* tools]
+    LP[list_paths]
+    GFC[get_file_contents]
+    GFS[get_file_snippet]
+    SC[search_code]
+    AU[ask_user]
+    LPD[list_project_descriptions]
+    GPOS[get_project_orion_summary]
   end
 
-  subgraph Edge
-    CDN[CDN/Edge Cache]
-    WAF[WAF/Firewall]
-  end
+  OA -->|calls| Tools
+  Tools -->|read/write| REPO[(Local Repo)]
+  Tools -->|PDs & POS| EXT[(External Project Descriptions)]
 
-  subgraph Backend
-    Web[Web App / SSR]
-    API[API Service]
-    Worker[Background Worker]
-  end
-
-  subgraph Data
-    DB[(Relational DB)]
-    Cache[(Redis Cache)]
-    MQ[(Message Queue)]
-    Object[(Object Storage)]
-  end
-
-  subgraph Integrations
-    Auth[(Auth Provider)]
-    Payment[(Payment Gateway)]
-    Email[(Email/SMS Service)]
-    Analytics[(Analytics/Telemetry)]
-  end
-
-  Browser --> CDN
-  CDN --> WAF
-  WAF --> Web
-  WAF --> API
-  Web --> API
-  API --> DB
-  API --> Cache
-  API --> MQ
-  MQ --> Worker
-  Worker --> DB
-  Worker --> Object
-  API --> Auth
-  API --> Payment
-  Worker --> Email
-  Web --> Analytics
-  API --> Analytics
+  OA -->|Strict JSON (mode, explanation, files, issues)| HOST[Host App]
+  HOST -->|Apply patches| REPO
 ```
 
-Key responsibilities
-- Web: Server-side rendering (if applicable), static asset delivery, and coordinating client views.
-- API: Business logic, validation, and data access. Publishes domain events.
-- Worker: Consumes events/jobs, executes long-running or retryable tasks.
-- DB: System of record for transactional data.
-- Cache: Low-latency reads, ephemeral coordination, rate limiting.
-- MQ: Decouples producers/consumers for asynchronous patterns.
-- Object Storage: Binary assets, reports, exports.
-- Integrations: Authentication, payments, notifications, analytics.
 
-Environments
-- Local: Developer workstations, mocked integrations.
-- CI: Automated tests, linting, builds.
-- Staging: Pre-production validation with production-like data shape.
-- Production: User traffic, scale, and SLOs.
+<!-- orion: Outlining the end-to-end lifecycle provides context for when and why each tool is used and how outputs are consumed. -->
+## End-to-End Lifecycle
+1. Input arrives containing change specs and the current contents of affected files.
+2. The assistant evaluates whether more context is required; if so, it calls tools (possibly in parallel) to fetch files, snippets, or project summaries.
+3. If requirements are ambiguous, the assistant may use ask_user to clarify.
+4. The assistant generates a strict JSON response including file patches with `orion:` comments and any issues detected.
+5. The host app applies the patches to the repository and reports results.
 
-## 2) Request Lifecycle (Sync path)
 
-Purpose: Show how a typical user request traverses the system and where data is cached or persisted.
-
+<!-- orion: Adding a sequence diagram for the conversation/preview flow to illustrate interactive steps and optional clarifications. -->
+## Conversation Preview Flow (Sequence)
 ```mermaid
 sequenceDiagram
   participant U as User
-  participant B as Browser/App
-  participant E as Edge/CDN
-  participant W as Web/App Server
-  participant A as API Service
-  participant C as Cache (Redis)
-  participant D as DB
-  participant Q as Message Queue
-  participant X as External Service
+  participant O as Orion Apply
+  participant T as functions.tools
+  participant R as Local Repo
+  participant H as Host App
 
-  U->>B: Perform action (click/submit)
-  B->>E: HTTPS request
-  E->>W: Cache miss/proxy
-  W->>A: Internal API call
-  A->>C: Read-through cache lookup
-  alt Cache hit
-    C-->>A: Return cached value
-  else Cache miss
-    A->>D: Query/Update
-    D-->>A: Rows/Result
-    A->>C: Set cache with TTL
+  U->>O: Submit change specs + affected files
+  O->>T: list_paths / get_file_contents / search_code (if needed)
+  T->>R: Read repository files
+  T-->>O: File contents / metadata
+  alt Ambiguity detected
+    O-->>U: ask_user(prompt)
+    U-->>O: Clarification response
   end
-  A->>Q: Publish domain event (optional)
-  A-->>W: Response DTO
-  W-->>E: Rendered HTML or JSON
-  E-->>B: 200 OK
-  Note over Q: Background processing continues out-of-band
+  O-->>H: Strict JSON proposal (mode, explanation, files, issues)
 ```
 
-Notes
-- Prefer idempotent write endpoints; use request IDs to de-duplicate.
-- Cache keys should include tenant/user-scoped namespaces when applicable.
-- Publish events for side effects (emails, analytics, search indexing) to keep the request path fast.
 
-## 3) Background Jobs and Event Handling
-
-Purpose: Document reliability patterns (retries, DLQs) for asynchronous work.
-
+<!-- orion: Showing the apply sequence to clarify how patches are materialized and where the `orion:` rationale comments appear. -->
+## Apply Flow (Sequence)
 ```mermaid
-flowchart TD
-  S([Start]) --> F[Fetch message from queue]
-  F -->|None| W([Wait/Backoff])
-  W --> F
-  F -->|Message| D[Deserialize + validate]
-  D -->|Invalid| DLQ[Send to Dead Letter Queue]
-  D -->|Valid| H[Handle job]
-  H -->|Success| ACK[Acknowledge]
-  H -->|Retryable error| R[Increment attempt + backoff]
-  R --> F
-  H -->|Non-retryable error| DLQ
-  ACK --> E([End])
+sequenceDiagram
+  participant H as Host App
+  participant O as Orion Apply
+  participant R as Local Repo
+
+  O-->>H: JSON with file patches
+  H->>R: Write/modify files with `orion:` comments preceding changes
+  H-->>O: Status (success / conflicts)
 ```
 
-Operational guidance
-- Retries: Exponential backoff with jitter; cap attempts; observe idempotency.
-- DLQ: Inspect, fix, and replay; alert on DLQ growth.
-- Timeouts: Keep handler timeouts below queue visibility timeouts.
 
-## 4) CI/CD Pipeline (from PR to Production)
-
-Purpose: Clarify how code changes are tested, built, and deployed.
-
+<!-- orion: Visualizing summarization flows to document how PDs and POS are obtained for cross-project awareness. -->
+## Summarization Flows
+### List Project Descriptions (PDs)
 ```mermaid
-flowchart LR
-  Dev[Developer] --> PR[Open Pull Request]
-  PR --> CI[Run CI: lint, typecheck, tests]
-  CI --> OK{All checks pass?}
-  OK -- No --> Fix[Iterate]
-  OK -- Yes --> Build[Build artifact/image]
-  Build --> Stage[Deploy to Staging]
-  Stage --> QA[Smoke tests, E2E]
-  QA -->|Approve| Prod[Deploy to Production]
-  Prod --> Mon[Monitor + Auto-rollbacks]
+sequenceDiagram
+  participant O as Orion Apply
+  participant T as functions.list_project_descriptions
+  participant E as External PD Directory
+
+  O->>T: list_project_descriptions()
+  T->>E: Enumerate PD filenames
+  T-->>O: PD list
 ```
 
-Best practices
-- Immutable images, pinned dependencies, SBOM generation.
-- Progressive delivery (canary/blue-green) with health checks.
-- Automated database migrations with safe rollout and rollback plans.
+### Get Project Orion Summary (POS)
+```mermaid
+sequenceDiagram
+  participant O as Orion Apply
+  participant T as functions.get_project_orion_summary
+  participant E as External PD Directory
 
-## 5) Configuration and Secrets
+  O->>T: get_project_orion_summary(filename)
+  T->>E: Load PD (regenerate POS if stale)
+  T-->>O: POS contents
+```
 
-Principles
-- Configuration is code: declarative, versioned defaults; environment overrides.
-- Twelve-Factor: Use environment variables; do not commit secrets.
-- Consistent precedence: Default config < environment-specific < environment variables < runtime flags.
 
-Configuration sources
-- Environment variables: e.g.,
-  - APP_ENV (local|ci|staging|prod)
-  - APP_PORT (e.g., 8080)
-  - DATABASE_URL (Postgres connection string)
-  - REDIS_URL
-  - QUEUE_URL
-  - OBJECT_STORAGE_BUCKET
-  - EXTERNAL_AUTH_DOMAIN / CLIENT_ID / CLIENT_SECRET
-  - FEATURE_FLAGS (JSON or provider key)
-  - LOG_LEVEL (debug|info|warn|error)
-- Files: config/*.yaml or .env files for local only (never in production).
-- Secret manager: e.g., AWS Secrets Manager, GCP Secret Manager, Vault.
+<!-- orion: Defining strict data contracts reduces ambiguity and prevents schema drift between the assistant and the host app. -->
+## Data Contracts
+### Input (Change Request)
+- Change Specs: Array of change items
+  - id: string
+  - title: string
+  - description: string
+  - items: array of file-level intents, each with:
+    - path: string
+    - change_type: "modify" | "add" | "delete"
+    - summary_of_change: string
+- Files: Array of current file payloads
+  - path: string
+  - content: string (entire file, if provided)
 
-Runtime configuration patterns
-- Read-only config snapshot at boot; hot-reload only where safe.
-- Validate early; fail-fast with clear errors.
-- Redact sensitive values in logs and diagnostics.
+Example snippet:
+```
+{
+  "changes": [
+    {
+      "id": "overview-doc-v1",
+      "title": "Add comprehensive repository Overview with Mermaid diagrams",
+      "description": "...",
+      "items": [
+        { "path": "Overview.md", "change_type": "modify", "summary_of_change": "..." }
+      ]
+    }
+  ],
+  "files": [ { "path": "Overview.md", "content": "" } ]
+}
+```
 
-## 6) Data and Schema
+### Output (Assistant Response)
+- mode: "ok" | "incompatible"
+- explanation: string (human-readable summary)
+- files: array of file patches
+  - path: string
+  - is_new: boolean
+  - code: string (full file contents after applying changes)
+- issues: array of discovered issues
+  - reason: string
+  - paths: array<string>
 
-- Primary store: Relational DB for transactional integrity (ACID). Use migrations.
-- Caching: Redis for hot keys; define TTLs and invalidation strategies.
-- Object storage: Large binaries, exports, and assets with signed URLs.
-- Event data: Prefer append-only event logs or analytics sinks for BI.
+Example snippet:
+```
+{
+  "mode": "ok",
+  "explanation": "...",
+  "files": [
+    { "path": "Overview.md", "is_new": false, "code": "<file content>" }
+  ],
+  "issues": []
+}
+```
 
-## 7) Observability and Operations
+### Tool Call Parameters (selected)
+- list_paths: { glob?: string }
+- get_file_contents: { path: string }
+- get_file_snippet: { path: string, start_line: number, end_line: number }
+- search_code: { query: string, max_results?: number }
+- ask_user: { prompt: string }
+- list_project_descriptions: {}
+- get_project_orion_summary: { filename: string }
+- multi_tool_use.parallel: { tool_uses: Array<{ recipient_name: "functions.<tool>", parameters: object }>} (parallelizable only)
 
-- Logging: Structured, JSON logs with correlation IDs (trace_id, span_id, request_id, user_id).
-- Metrics: RED/USE metrics for services; SLI/SLO definitions for latency, error rate, and availability.
-- Tracing: Distributed tracing across Web, API, Worker, and external calls.
-- Dashboards: Per-service views for health, saturation, and errors.
-- Alerting: Page on user-impacting symptoms; ticket on non-urgent issues.
 
-Runbooks
-- Incident response steps, rollback procedures, feature-flag kill switches.
-- On-call quick links: dashboards, logs, tracing, feature flag console, DLQ browser.
+<!-- orion: Clarifying configuration knobs ensures predictable behavior across environments and use cases. -->
+## Configuration and Conventions
+- Strict JSON Output
+  - Always return a single JSON object with the prescribed fields.
+- Rationale Comments
+  - Insert `orion:` comments immediately before each change in code/doc files. If a prior `orion:` comment exists, update it to reflect new reasoning.
+- Tool Usage Policy
+  - Prefer tools when additional context is needed. Use multi_tool_use.parallel when calls can safely run concurrently.
+- Formatting Constraints
+  - Default to minimal formatting unless the request explicitly asks for diagrams or rich formatting (as in this document).
+- Knowledge Cutoff and Dates
+  - Be mindful of the assistant’s knowledge cutoff and current date context.
+- Safety and Privacy
+  - Do not include hidden reasoning in outputs. Use ask_user for sensitive or ambiguous cases.
+- Error Handling
+  - Use mode: "incompatible" if the request cannot be satisfied as asked. Provide reasons in issues.
+- Timeouts and Idempotency
+  - Keep tool calls deterministic where possible; retry or report clearly on failures.
 
-## 8) Security and Compliance
 
-- Authentication: External IdP or first-party auth; tokens with short TTLs; refresh flows.
-- Authorization: Role/attribute-based checks enforced in API and UI.
-- Secrets: Managed in a secure store; rotated regularly; principle of least privilege.
-- Data protection: At-rest encryption for DB/object storage; TLS in transit.
-- Input validation: Schema validation at boundaries; output encoding for UI.
-- Auditing: Critical actions logged with immutable, tamper-evident storage where required.
+<!-- orion: Providing a quick checklist helps maintain quality and consistency for future changes. -->
+## Quality Checklist
+- Requirements understood or clarified via ask_user.
+- Relevant files discovered (list_paths/search_code) and retrieved.
+- Patches include updated content and `orion:` rationale comments.
+- Output JSON validates against the expected schema.
+- Issues array lists uncertainties or blockers.
 
-## 9) Local Development
 
-- Prerequisites: Docker, language runtime, package manager.
-- Suggested workflow
-  - Clone repo and copy .env.example to .env (local only).
-  - Start dependencies via docker-compose or dev containers.
-  - Run application services (web/api/worker) locally with hot reload.
-  - Seed minimal data and run smoke tests.
-
-- Common commands (adapt to this repo)
-  - make dev          # start app + dependencies
-  - make test         # run unit/integration tests
-  - make migrate      # apply database migrations
-
-## 10) Extension and Integration Points
-
-- Domain events: Publish/subscribe contracts for decoupled features.
-- Webhooks: Inbound/outbound patterns with signature validation and retries.
-- Feature flags: Progressive delivery and safe experimentation.
-- Modules/services: Clear ownership, SLAs, and error budgets.
-
-## 11) Glossary
-
-- API Service: The stateless service exposing business endpoints.
-- Worker: Asynchronous processor for queued jobs and events.
-- DLQ: Dead Letter Queue for messages that repeatedly fail.
-- SLO: Service Level Objective; target for reliability.
-- Canary: Partial traffic rollout to test new versions safely.
+<!-- orion: Offering a brief FAQ to address recurring contributor questions and prevent misuse. -->
+## FAQ
+- When should I use ask_user?
+  - When critical details are missing or ambiguous and cannot be inferred safely from context.
+- When is multi_tool_use.parallel appropriate?
+  - When multiple independent tool calls can run concurrently (e.g., fetching contents of several files).
+- What if a file already contains an `orion:` comment?
+  - Update the existing comment to reflect the latest reasoning for that change rather than adding duplicates.
