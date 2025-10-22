@@ -1,0 +1,736 @@
+# orion: Ported the core Orion class, tool definitions, command handlers, bootstrap/summaries flow, and change-spec validators from editor.py into a focused module. Adjusted imports to use the new modular structure.
+
+import json
+import pathlib
+from typing import Any, Dict, List, Optional
+
+from .config import OPENAI_API_KEY, AI_MODEL, LINE_CAP
+from .context import Context, Storage
+from .client import ChatCompletionsClient
+from .external import ext_dir_valid, list_project_descriptions
+from .fs import (
+    list_all_nonignored_files,
+    normalize_path,
+    read_file,
+    write_file,
+    count_lines,
+    colocated_summary_path,
+    now_ts,
+    short_id,
+)
+from .summarizers import ensure_all_pos, summarize_file
+from .tools import (
+    tool_list_paths,
+    tool_get_file_contents,
+    tool_get_file_snippet,
+    tool_get_summary,
+    tool_search_code,
+    tool_ask_user,
+)
+
+
+# -----------------------------
+# Strict schemas and change-spec helpers
+# -----------------------------
+
+def make_change_spec(id_str: str, title: str, description: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "id": id_str,
+        "title": title,
+        "description": description,
+        "items": items,
+    }
+
+
+def make_change_item(path: str, change_type: str, summary_of_change: str) -> Dict[str, Any]:
+    if change_type not in ["modify", "create", "delete", "move", "rename"]:
+        raise ValueError("Invalid change_type")
+    return {"path": normalize_path(path), "change_type": change_type, "summary_of_change": summary_of_change}
+
+
+def validate_change_specs(changes: Any) -> List[Dict[str, Any]]:
+    if not isinstance(changes, list):
+        return []
+    prepared = []
+    for ch in changes:
+        if not isinstance(ch, dict):
+            continue
+        required_keys = ["id", "title", "description", "items"]
+        if any(k not in ch for k in required_keys):
+            continue
+        items = ch.get("items", [])
+        if not isinstance(items, list):
+            continue
+        ok_items = True
+        for it in items:
+            if not isinstance(it, dict):
+                ok_items = False
+                break
+            if any(ik not in it for ik in ["path", "change_type", "summary_of_change"]):
+                ok_items = False
+                break
+            if it.get("change_type") not in ["modify", "create", "delete", "move", "rename"]:
+                ok_items = False
+                break
+        if not ok_items:
+            continue
+        for it in items:
+            it["path"] = normalize_path(it["path"])
+        prepared.append({"id": ch["id"], "title": ch["title"], "description": ch["description"], "items": items})
+    return prepared
+
+
+def validate_apply_response(resp: Dict[str, Any]) -> (bool, str):
+    required_keys = ["mode", "explanation", "files", "issues"]
+    for k in required_keys:
+        if k not in resp:
+            return False, f"ApplyResponse missing required field: {k}"
+    if resp["mode"] not in ["ok", "incompatible"]:
+        return False, "ApplyResponse.mode must be 'ok' or 'incompatible'"
+    if not isinstance(resp["explanation"], str):
+        return False, "ApplyResponse.explanation must be string"
+    if not isinstance(resp["files"], list) or not isinstance(resp["issues"], list):
+        return False, "ApplyResponse.files and issues must be arrays"
+    for f in resp["files"]:
+        for fk in ["path", "is_new", "code"]:
+            if fk not in f:
+                return False, f"ApplyResponse.files item missing field: {fk}"
+        if not isinstance(f["path"], str):
+            return False, "file.path must be string"
+        if not isinstance(f["is_new"], bool):
+            return False, "file.is_new must be boolean"
+        if not isinstance(f["code"], str):
+            return False, "file.code must be string"
+    for issue in resp["issues"]:
+        for ik in ["reason", "paths"]:
+            if ik not in issue:
+                return False, f"Issue missing field: {ik}"
+        if not isinstance(issue["reason"], str):
+            return False, "issue.reason must be string"
+        if not isinstance(issue["paths"], list) or not all(isinstance(p, str) for p in issue["paths"]):
+            return False, "issue.paths must be array of strings"
+    return True, ""
+
+
+# -----------------------------
+# Tools exposed to the model (definitions)
+# -----------------------------
+
+def tool_definitions() -> List[Dict[str, Any]]:
+    # Local repo tools + external dependency tools
+    defs = [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_paths",
+                "description": "List repository files; optionally filter by glob.",
+                "parameters": {"type": "object", "properties": {"glob": {"type": "string"}}, "required": [], "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_file_contents",
+                "description": "Return full contents for a file.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_file_snippet",
+                "description": "Return a line-range snippet for a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}},
+                    "required": ["path", "start_line", "end_line"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_summary",
+                "description": "Return a brief machine-oriented summary for a local repo file, if available.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_code",
+                "description": "Search files for a substring; returns paths.",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["query"], "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ask_user",
+                "description": "Ask the user for a clarification.",
+                "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"], "additionalProperties": False},
+            },
+        },
+    ]
+
+    # External dependency tools (flat directory)
+    defs.extend(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_project_descriptions",
+                    "description": "List dependency Project Descriptions (filenames) from the external directory.",
+                    "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_project_orion_summary",
+                    "description": "Return the Project Orion Summary (POS) for a given PD filename; regenerates if stale.",
+                    "parameters": {"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"], "additionalProperties": False},
+                },
+            },
+        ]
+    )
+    return defs
+
+
+# -----------------------------
+# Orion main class
+# -----------------------------
+
+
+class Orion:
+    def __init__(self, repo_root: pathlib.Path) -> None:
+        self.repo_root = repo_root.resolve()
+        self.storage = Storage(self.repo_root)
+        self.md = self.storage.load_metadata()
+        self.history = self.storage.load_history()
+        self.client = ChatCompletionsClient(OPENAI_API_KEY, AI_MODEL)
+
+        # External dependency root (flat)
+        from .config import ORION_EXTERNAL_DIR
+
+        self.ext_root: Optional[pathlib.Path] = ext_dir_valid(ORION_EXTERNAL_DIR)
+
+        # Build tools registry for interactive execution
+        self.tools_registry = {
+            # Local repo
+            "list_paths": lambda ctx, args: tool_list_paths(ctx, self.repo_root, args),
+            "get_file_contents": lambda ctx, args: tool_get_file_contents(ctx, self.repo_root, args),
+            "get_file_snippet": lambda ctx, args: tool_get_file_snippet(ctx, self.repo_root, args),
+            "get_summary": lambda ctx, args: tool_get_summary(ctx, self, args),
+            "search_code": lambda ctx, args: tool_search_code(ctx, self.repo_root, args),
+            "ask_user": lambda ctx, args: tool_ask_user(ctx, args),
+            # External dependencies (flat)
+            "list_project_descriptions": lambda ctx, args: self._tool_list_pds(ctx, args),
+            "get_project_orion_summary": lambda ctx, args: self._tool_get_pos(ctx, args),
+        }
+
+    # ---------- External tools (flat) ----------
+
+    def _tool_list_pds(self, ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.ext_root:
+            return {"_meta_error": "ORION_EXTERNAL_DIR not set or invalid.", "_args_echo": args}
+        try:
+            items = list_project_descriptions(self.ext_root)
+            return {"filenames": items, "_args_echo": args}
+        except Exception as e:
+            return {"_meta_error": f"list_pds failed: {e}", "_args_echo": args}
+
+    def _tool_get_pos(self, ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.ext_root:
+            return {"_meta_error": "ORION_EXTERNAL_DIR not set or invalid.", "_args_echo": args}
+        filename = str(args.get("filename") or "")
+        if not filename:
+            return {"_meta_error": "filename required", "_args_echo": args}
+        try:
+            from .summarizers import ensure_pos
+
+            pos = ensure_pos(ctx, self.ext_root, filename, self.client)
+            if not pos:
+                return {"_meta_error": f"no POS available for {filename}", "_args_echo": args}
+            return {"filename": filename, "summary": pos, "_args_echo": args}
+        except Exception as e:
+            return {"_meta_error": f"get_pos failed for {filename}: {e}", "_args_echo": args}
+
+    # ---------- Bootstrap helpers ----------
+
+    def _build_bootstrap_message(self, ctx: Context) -> Dict[str, Any]:
+        """
+        Build a one-time bootstrap system message with the complete file list and colocated summaries (if present).
+        Also includes external dependency heads (flat) if ORION_EXTERNAL_DIR is set.
+        """
+        files = list_all_nonignored_files(self.repo_root)
+        items = []
+        for p in files:
+            summ = None
+            sp = colocated_summary_path(self.repo_root, p)
+            if sp.exists():
+                try:
+                    with sp.open("r", encoding="utf-8") as f:
+                        summ = json.load(f)
+                except Exception:
+                    summ = None
+            items.append({"path": p, "summary": summ})
+
+        payload: Dict[str, Any] = {
+            "type": "orion_bootstrap",
+            "note": "This is the complete list of files in the repository at this time; treat it as authoritative.",
+            "complete_list": True,
+            "files": items,
+        }
+
+        # External dependency heads (filenames + small counts)
+        if self.ext_root:
+            try:
+                heads = ensure_all_pos(ctx, self.ext_root, self.client)
+            except Exception:
+                heads = []
+            payload["dependency_projects"] = heads
+
+        return {"role": "system", "content": json.dumps(payload, ensure_ascii=False)}
+
+    def _ensure_bootstrap_if_new_conversation(self, ctx: Context) -> None:
+        """
+        If there is no conversation history file, refresh summaries and persist a bootstrap message.
+        Also ensures external POS are created/validated on first run.
+        """
+        if not self.storage.conv_file.exists():
+            # Refresh local summaries first (small repo assumption)
+            self._refresh_summaries(ctx)
+            # Ensure external POS (if configured)
+            if self.ext_root:
+                ensure_all_pos(ctx, self.ext_root, self.client)
+            bootstrap_msg = self._build_bootstrap_message(ctx)
+            self.storage.append_raw_message(bootstrap_msg)
+            self.history.append(bootstrap_msg)
+
+    # ---------- Commands ----------
+
+    def cmd_help(self, ctx: Context) -> None:
+        ctx.error_message("Commands:")
+        ctx.send_to_user(":preview              - Show pending changes")
+        ctx.send_to_user(":apply                - Apply all pending changes")
+        ctx.send_to_user(":discard-change <id>  - Discard a pending change by id")
+        ctx.send_to_user(":refresh              - Rescan repo and refresh summaries")
+        ctx.send_to_user(":refresh-deps         - Refresh Project Orion Summaries for external dependencies")
+        ctx.send_to_user(":status               - Show status summary")
+        ctx.send_to_user(":consolidate          - Manually consolidate pending changes")
+        ctx.send_to_user(":help                 - Show this help")
+        ctx.send_to_user(":quit                 - Exit")
+
+    def cmd_preview(self, ctx: Context) -> None:
+        changes = self.md["pending_changes"]
+        if not changes:
+            ctx.send_to_user("No pending changes.")
+            return
+        ctx.send_to_user(f"Pending changes ({len(changes)}):")
+        for ch in changes:
+            ctx.send_to_user(f"- {ch['id']} | {ch['title']}")
+            ctx.send_to_user(f"  {ch['description']}")
+            for it in ch.get("items", []):
+                ctx.send_to_user(f"  * {it['change_type']} {it['path']} — {it['summary_of_change']}")
+
+    def cmd_discard_change(self, ctx: Context, change_id: str) -> None:
+        before = len(self.md["pending_changes"])
+        self.md["pending_changes"] = [c for c in self.md["pending_changes"] if c.get("id") != change_id]
+        after = len(self.md["pending_changes"])
+        if before == after:
+            ctx.send_to_user(f"No change with id {change_id} found.")
+        else:
+            self.storage.save_metadata(self.md)
+            ctx.send_to_user(f"Discarded change {change_id}.")
+
+    def _refresh_summaries(self, ctx: Context, only_paths: Optional[List[str]] = None) -> None:
+        # Determine file list
+        if only_paths is not None:
+            files = [normalize_path(p) for p in only_paths]
+        else:
+            files = list_all_nonignored_files(self.repo_root)
+
+        if not files:
+            ctx.log("No files found for summarization.")
+            return
+
+        path_to_digest = self.md.get("path_to_digest", {})
+        self.md["path_to_digest"] = path_to_digest
+
+        changed: List[str] = []
+        skipped = 0
+        created = 0
+        from .config import SUMMARY_MAX_BYTES
+        from .fs import _safe_abs, sha256_bytes
+
+        for rel in files:
+            # skip our internal .orion dirs (already excluded by listing, but guard anyway)
+            if ".orion" in pathlib.Path(rel).parts:
+                continue
+            # size cap
+            try:
+                ap = _safe_abs(self.repo_root, rel)
+                if ap.stat().st_size > SUMMARY_MAX_BYTES:
+                    skipped += 1
+                    continue
+            except Exception:
+                continue
+            # compute digest
+            try:
+                b = ap.read_bytes()
+            except Exception:
+                continue
+            digest = sha256_bytes(b)
+            prev = path_to_digest.get(rel)
+            need = prev != digest
+            if need:
+                res = summarize_file(ctx, self.client, self.repo_root, rel)
+                if res:
+                    path_to_digest[rel] = digest
+                    changed.append(rel)
+                    created += 1
+                    self.storage.save_metadata(self.md)
+        if only_paths is not None:
+            ctx.log(f"Refreshed summaries for {len(changed)} file(s); skipped {skipped} large file(s).")
+        else:
+            ctx.log(f"Summarization complete. Updated {len(changed)} file(s); skipped {skipped} large file(s).")
+
+    def cmd_refresh(self, ctx: Context) -> None:
+        self._refresh_summaries(ctx)
+        # Also refresh external dependency POS if configured
+        if self.ext_root:
+            from .summarizers import ensure_all_pos
+
+            ensure_all_pos(ctx, self.ext_root, self.client)
+            ctx.log("Refreshed external dependency Project Orion Summaries.")
+
+    def cmd_refresh_deps(self, ctx: Context) -> None:
+        if not self.ext_root:
+            ctx.log("ORION_EXTERNAL_DIR not set or invalid; nothing to refresh.")
+            return
+        from .summarizers import ensure_all_pos
+
+        ensure_all_pos(ctx, self.ext_root, self.client)
+        ctx.log("Refreshed external dependency Project Orion Summaries.")
+
+    def cmd_status(self, ctx: Context) -> None:
+        total_files = len(list_all_nonignored_files(self.repo_root))
+        dep_count = 0
+        if self.ext_root:
+            try:
+                dep_count = len(list_project_descriptions(self.ext_root))
+            except Exception:
+                dep_count = 0
+        ctx.send_to_user(f"Repo root: {self.repo_root}")
+        ctx.send_to_user(f"Plan ID: {self.md['plan_state']['plan_id']}")
+        ctx.send_to_user(f"Pending changes: {len(self.md['pending_changes'])}")
+        ctx.send_to_user(f"Batches since last consolidation: {self.md['batches_since_last_consolidation']}")
+        ctx.send_to_user(f"Commit log entries: {len(self.md['plan_state']['commit_log'])}")
+        ctx.send_to_user(f"Files (non-ignored): {total_files}")
+        ctx.send_to_user(f"Tracked digests: {len(self.md.get('path_to_digest', {}))}")
+        if self.ext_root:
+            ctx.send_to_user(f"External PD root: {self.ext_root} (flat). PD files: {dep_count}")
+
+    def cmd_consolidate(self, ctx: Context) -> None:
+        changes = self.md["pending_changes"]
+        seen = set()
+        consolidated = []
+        for ch in changes:
+            key = (ch["title"], tuple(sorted(it["path"] for it in ch.get("items", []))))
+            if key in seen:
+                continue
+            seen.add(key)
+            consolidated.append(ch)
+        self.md["pending_changes"] = consolidated
+        self.md["batches_since_last_consolidation"] = 0
+        self.storage.save_metadata(self.md)
+        ctx.log(f"Consolidated. Pending changes now: {len(self.md['pending_changes'])}")
+
+    def auto_consolidate_if_needed(self, ctx: Context) -> None:
+        n = self.md["batches_since_last_consolidation"]
+        if n >= 3 and n % 3 == 0:
+            ctx.log("Auto-consolidating changes...")
+            self.cmd_consolidate(ctx)
+
+    def cmd_apply(self, ctx: Context) -> None:
+        pending = self.md["pending_changes"]
+        if not pending:
+            ctx.send_to_user("No pending changes to apply.")
+            return
+        # Collect affected paths and current contents
+        affected = set()
+        for ch in pending:
+            for it in ch.get("items", []):
+                affected.add(it["path"])
+        files_payload = []
+        for p in sorted(affected):
+            content = ""
+            abs_path = self.repo_root / p
+            if abs_path.exists():
+                try:
+                    content = read_file(self.repo_root, p)
+                except Exception:
+                    content = ""
+            files_payload.append({"path": p, "content": content})
+
+        system_text = (
+            "You are Orion Apply. You will receive the accumulated change specs and the current contents of affected files. "
+            "If you need more context, call tools. Then return a strict JSON object with fields: "
+            "mode ('ok'|'incompatible'), explanation (string), files (array of {path,is_new,code}), issues (array of {reason,paths}). "
+            "Do not include hidden reasoning. For non-applicable arrays, return empty arrays."
+            "Remember to add a comment just before every change you make explaining the reasoning behind the change. Start these comments with `orion:` . If you find a comment already exists at that point update it to reflect your reasoning."
+        )
+        user_text = json.dumps({"changes": pending, "files": files_payload}, ensure_ascii=False)
+
+        response_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "mode": {"type": "string", "enum": ["ok", "incompatible"]},
+                "explanation": {"type": "string"},
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {"path": {"type": "string"}, "is_new": {"type": "boolean"}, "code": {"type": "string"}},
+                        "required": ["path", "is_new", "code"],
+                    },
+                },
+                "issues": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {"reason": {"type": "string"}, "paths": {"type": "array", "items": {"type": "string"}}},
+                        "required": ["reason", "paths"],
+                    },
+                },
+            },
+            "required": ["mode", "explanation", "files", "issues"],
+        }
+
+        tools = tool_definitions()
+
+        def runner(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+            fn = self.tools_registry.get(name)
+            if not fn:
+                return {"_meta_error": f"unknown tool {name}", "_args_echo": args}
+            return fn(ctx, args)
+
+        messages = [{"role": "system", "content": system_text}, {"role": "user", "content": user_text}]
+        ctx.log("Calling model to apply changes...")
+        final_json = self.client.call_chatcompletions(ctx, messages, tools, response_schema, interactive_tool_runner=runner)
+        ok, err = validate_apply_response(final_json)
+        if not ok:
+            ctx.error_message(f"Apply failed: invalid response from model: {err}")
+            return
+
+        if final_json["mode"] == "incompatible":
+            ctx.send_to_user("Model reported incompatibility:")
+            for issue in final_json["issues"]:
+                ctx.send_to_user(f"- {issue['reason']}: {', '.join(issue['paths'])}")
+            ctx.send_to_user(f"Explanation: {final_json['explanation']}")
+            return
+
+        # Write files
+        written_paths: List[str] = []
+        for f in final_json["files"]:
+            write_file(self.repo_root, f["path"], f["code"])
+            written_paths.append(f["path"])
+
+        # Commit log entry
+        self.md["plan_state"]["commit_log"].append(
+            {"id": short_id("commit"), "ts": now_ts(), "paths": [f["path"] for f in final_json["files"]], "explanation": final_json["explanation"]}
+        )
+        self.storage.save_metadata(self.md)
+        ctx.log(f"Wrote {len(final_json['files'])} files. Explanation: {final_json['explanation']}")
+
+        # Refresh summaries for written files (including brand-new files)
+        if written_paths:
+            self._refresh_summaries(ctx, only_paths=written_paths)
+
+        # Clear conversation and pending changes
+        self.storage.clear_history()
+        self.history = []
+        self.md["pending_changes"] = []
+        self.md["batches_since_last_consolidation"] = 0
+        self.storage.save_metadata(self.md)
+        ctx.log("Cleared conversation history and pending change log.")
+
+        # Post-apply LINE_CAP follow-ups
+        added_splits = 0
+        for f in final_json["files"]:
+            lines = count_lines(f["code"])
+            if lines > LINE_CAP:
+                path = f["path"]
+                stem = pathlib.Path(path).stem
+                ext = pathlib.Path(path).suffix
+                target2 = normalize_path(str(pathlib.Path(path).with_name(f"{stem}_part2{ext}")))
+                change_id = short_id("split")
+                split_change = make_change_spec(
+                    change_id,
+                    f"Split {path} to meet LINE_CAP",
+                    "Split required to reduce line count",
+                    [
+                        make_change_item(path, "modify", f"Reduce lines from {lines} to below {LINE_CAP}"),
+                        make_change_item(target2, "create", "Create second part of split"),
+                    ],
+                )
+                self.md["pending_changes"].append(split_change)
+                added_splits += 1
+        if added_splits:
+            self.storage.save_metadata(self.md)
+            ctx.log(f"Added {added_splits} split follow-up change(s) due to LINE_CAP.")
+
+    def handle_user_input(self, ctx: Context, text: str) -> None:
+        # Commands
+        if text.startswith(":"):
+            parts = text.strip().split()
+            cmd = parts[0]
+            if cmd == ":help":
+                self.cmd_help(ctx)
+            elif cmd == ":preview":
+                self.cmd_preview(ctx)
+            elif cmd == ":apply":
+                self.cmd_apply(ctx)
+            elif cmd == ":discard-change":
+                if len(parts) < 2:
+                    ctx.error_message("Usage: :discard-change <id>")
+                else:
+                    self.cmd_discard_change(ctx, parts[1])
+            elif cmd == ":clear-changes":
+                self.md["pending_changes"] = []
+                self.storage.save_metadata(self.md)
+                ctx.send_to_user("Cleared all pending changes.")
+            elif cmd == ":refresh":
+                self.cmd_refresh(ctx)
+            elif cmd == ":refresh-deps":
+                self.cmd_refresh_deps(ctx)
+            elif cmd == ":status":
+                self.cmd_status(ctx)
+            elif cmd == ":consolidate":
+                self.cmd_consolidate(ctx)
+            elif cmd == ":quit":
+                ctx.send_to_user("Goodbye.")
+                import sys
+
+                sys.exit(0)
+            else:
+                ctx.error_message(f"Unknown command: {cmd}. Type :help for help.")
+            return
+
+        # New conversation bootstrap if needed (no history file present)
+        self._ensure_bootstrap_if_new_conversation(ctx)
+
+        # Append user turn (raw)
+        self.storage.append_raw_message({"role": "user", "content": text})
+        self.history.append({"role": "user", "content": text})
+
+        # System prompt
+        system_text = (
+            "You are Orion Conversation. Respond with a strict JSON object:\n"
+            "{ assistant_message: string, changes: ChangeSpec[] }\n"
+            "ChangeSpec: { id, title, description, items[] }. ChangeItemSpec: { path, change_type, summary_of_change }.\n"
+            "All fields required; arrays may be empty when not applicable."
+        )
+
+        response_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "assistant_message": {"type": "string"},
+                "changes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "id": {"type": "string"},
+                            "title": {"type": "string"},
+                            "description": {"type": "string"},
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "path": {"type": "string"},
+                                        "change_type": {"type": "string", "enum": ["modify", "create", "delete", "move", "rename"]},
+                                        "summary_of_change": {"type": "string"},
+                                    },
+                                    "required": ["path", "change_type", "summary_of_change"],
+                                },
+                            },
+                        },
+                        "required": ["id", "title", "description", "items"],
+                    },
+                },
+            },
+            "required": ["assistant_message", "changes"],
+        }
+
+        # Rebuild messages: prepend conversation system prompt, then replay full stored history verbatim
+        messages = [{"role": "system", "content": system_text}]
+        for h in self.history:
+            msg: Dict[str, Any] = {"role": h["role"]}
+            if "content" in h:
+                msg["content"] = h["content"]
+            if "tool_calls" in h:
+                msg["tool_calls"] = h["tool_calls"]
+            if "tool_call_id" in h:
+                msg["tool_call_id"] = h["tool_call_id"]
+            messages.append(msg)
+
+        tools = tool_definitions()
+
+        def runner(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+            fn = self.tools_registry.get(name)
+            if not fn:
+                return {"_meta_error": f"unknown tool {name}", "_args_echo": args}
+            return fn(ctx, args)
+
+        # Sink to persist assistant/tool messages during the call
+        def sink(msg: Dict[str, Any]) -> None:
+            self.storage.append_raw_message(msg)
+            self.history.append(msg)
+
+        ctx.log("Calling model for conversation response...")
+        final_json = self.client.call_chatcompletions(
+            ctx, messages, tools, response_schema, interactive_tool_runner=runner, message_sink=sink
+        )
+
+        if "assistant_message" not in final_json or "changes" not in final_json:
+            ctx.log("Model returned invalid conversation response.")
+            return
+        assistant_msg = final_json["assistant_message"]
+        changes = validate_change_specs(final_json["changes"])
+        ctx.send_to_user(assistant_msg)
+        self.storage.append_history("assistant", assistant_msg, {"changes_count": len(changes)})
+        self.history.append({"role": "assistant", "content": assistant_msg})
+
+        if changes:
+            self.md["pending_changes"].extend(changes)
+            self.md["batches_since_last_consolidation"] += 1
+            self.storage.save_metadata(self.md)
+            self.auto_consolidate_if_needed(ctx)
+
+    def run(self) -> None:
+        print(f"Orion ready at repo root: {self.repo_root}")
+        if self.ext_root:
+            print(f"External dependency PD root: {self.ext_root} (flat)")
+        else:
+            print("External dependency PD root not set (ORION_EXTERNAL_DIR unset or invalid).")
+        print("Type :help for commands.")
+        ctx = Context()
+        while True:
+            try:
+                text = input("> ").strip()
+            except EOFError:
+                print("\nGoodbye.")
+                break
+            if not text:
+                continue
+            self.handle_user_input(ctx, text)
