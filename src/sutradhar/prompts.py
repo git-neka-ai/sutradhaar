@@ -1,4 +1,4 @@
-# orion: Introduced a small helper to load prompt templates from sutradhar.resources via importlib.resources and optionally format them with dynamic values. This centralizes prompt management and enables reuse across modules.
+# orion: Introduced a small helper to load prompt templates from sutradhar.resources via importlib.resources and optionally format them with dynamic values. This centralizes prompt management and enables reuse across modules. Added docstring clarifying brace handling and formatting behavior.
 
 from importlib import resources
 

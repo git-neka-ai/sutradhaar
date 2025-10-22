@@ -1,4 +1,4 @@
-# orion: Externalized system prompts to sutradhar.resources loaded via sutradhar.prompts.get_prompt. Also ensured imports are complete for existing logic.
+# orion: Externalized system prompts to sutradhar.resources loaded via sutradhar.prompts.get_prompt. Also ensured imports are complete for existing logic. Added docstrings and inline comments to clarify size limits, schema enforcement, and regeneration TTLs.
 
 import json
 import pathlib
@@ -15,10 +15,12 @@ from .prompts import get_prompt
 
 
 class CustomBaseModel(BaseModel):
+    """Pydantic base model configured to forbid unknown fields for strict validation."""
     model_config = ConfigDict(extra="forbid")
 
 
 class FileSummary(CustomBaseModel):
+    """Compact per-file summary optimized for LLM consumption (token minimized)."""
     # Compact keys
     v: int = Field(..., description="Schema version - use 1")
     p: str = Field(..., description="File path")
@@ -36,7 +38,10 @@ class FileSummary(CustomBaseModel):
     sm: List[str] = Field(..., description="List of notes on safe-to-modify areas")
 
 
+# orion: Add a small heuristic docstring for language detection.
+
 def guess_language(path: str) -> str:
+    """Guess a short language tag from a filename suffix (defaults to 'txt')."""
     ext = pathlib.Path(path).suffix.lower()
     return {
         ".py": "py",
@@ -50,7 +55,20 @@ def guess_language(path: str) -> str:
     }.get(ext, "txt")
 
 
+# orion: Document summarization flow, including size cap, schema validation, and colocated output.
+
 def summarize_file(ctx: Context, client: ChatCompletionsClient, repo_root: pathlib.Path, rel_path: str) -> Optional[Dict[str, Any]]:
+    """
+    Create or update a colocated JSON summary for a given source file.
+
+    Steps:
+      1) Enforce a maximum file size to bound tokens and latency.
+      2) Build a strict schema (FileSummary) and call the model with a system prompt.
+      3) Validate the response and write to a/b/.orion/file.ext.json using compact separators.
+
+    Returns:
+        Parsed summary object on success; None on failure or skip.
+    """
     abs_path = _safe_abs(repo_root, rel_path)
     # Skip very large files
     try:
@@ -111,12 +129,14 @@ def summarize_file(ctx: Context, client: ChatCompletionsClient, repo_root: pathl
     sp = colocated_summary_path(repo_root, rel_path)
     sp.parent.mkdir(parents=True, exist_ok=True)
     with sp.open("w", encoding="utf-8") as f:
+        # orion: Compact separators reduce on-disk size and token load during bootstrap.
         f.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     return obj
 
 
 class ProjectOrionSummary(CustomBaseModel):
+    """Compact project-level summary for external PD files, with strict fields and minimized keys."""
     # Minimal enforced POS schema (token-optimized)
     v: int = Field(..., description="Schema version - use 1")
     f: str = Field(..., description="Project Description filename")
@@ -126,6 +146,8 @@ class ProjectOrionSummary(CustomBaseModel):
     r: List[str] = Field(..., description="Risks/constraints (bullets)")
 
 
+# orion: Document the PD summarization flow and the use of Chat Completions for this schema.
+
 def summarize_project_description(
     ctx: Context,
     client: ChatCompletionsClient,
@@ -133,6 +155,19 @@ def summarize_project_description(
     filename: str,
     pd_hash: str,
 ) -> Optional[Dict[str, Any]]:
+    """
+    Summarize a Project Description (PD) file into a compact POS structure.
+
+    Args:
+        ctx: Context for logging.
+        client: OpenAI client for model calls.
+        ext_root: External PD directory.
+        filename: PD filename (flat directory).
+        pd_hash: Precomputed sha256 of the PD raw bytes.
+
+    Returns:
+        The validated POS dict or None on failure.
+    """
     pd_path = (ext_root / filename).resolve()
     try:
         data = pd_path.read_bytes()
@@ -178,6 +213,8 @@ def summarize_project_description(
 from .external import list_project_descriptions, read_pos, write_pos, hash_pd
 
 
+# orion: Document regeneration policy: on missing/corrupt, hash mismatch, or TTL expiry.
+
 def ensure_pos(ctx: Context, ext_root: pathlib.Path, filename: str, client: ChatCompletionsClient) -> Optional[Dict[str, Any]]:
     """
     Ensure a POS exists and matches PD hash. Regenerate if missing/hash-mismatch/stale TTL.
@@ -222,6 +259,8 @@ def ensure_pos(ctx: Context, ext_root: pathlib.Path, filename: str, client: Chat
 
     return pos
 
+
+# orion: Document that heads are returned for bootstrap and that stale POS are tolerated (optional GC comment).
 
 def ensure_all_pos(ctx: Context, ext_root: pathlib.Path, client: ChatCompletionsClient) -> List[Dict[str, Any]]:
     """

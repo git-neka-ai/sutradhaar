@@ -1,4 +1,4 @@
-# orion: Ported the core Orion class, tool definitions, command handlers, bootstrap/summaries flow, and change-spec validators from editor.py into a focused module. Adjusted imports to use the new modular structure. Externalized conversation/apply system prompts via sutradhar.prompts.get_prompt.
+# orion: Ported the core Orion class, tool definitions, command handlers, bootstrap/summaries flow, and change-spec validators from editor.py into a focused module. Adjusted imports to use the new modular structure. Externalized conversation/apply system prompts via sutradhar.prompts.get_prompt. Added docstrings and inline comments where flow or validation is non-obvious.
 
 import json
 import pathlib
@@ -34,7 +34,10 @@ from .prompts import get_prompt
 # Strict schemas and change-spec helpers
 # -----------------------------
 
+# orion: Add helper docstrings to clarify expected shapes used by the model and apply pipeline.
+
 def make_change_spec(id_str: str, title: str, description: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build a change spec object with the required keys for Orion's apply flow."""
     return {
         "id": id_str,
         "title": title,
@@ -43,13 +46,24 @@ def make_change_spec(id_str: str, title: str, description: str, items: List[Dict
     }
 
 
+# orion: Document allowed change_type values for model guidance consistency.
+
 def make_change_item(path: str, change_type: str, summary_of_change: str) -> Dict[str, Any]:
+    """Build a single change item with normalized path and a concise summary."""
     if change_type not in ["modify", "create", "delete", "move", "rename"]:
         raise ValueError("Invalid change_type")
     return {"path": normalize_path(path), "change_type": change_type, "summary_of_change": summary_of_change}
 
 
+# orion: Validate and normalize a list of change specs provided by the model.
+
 def validate_change_specs(changes: Any) -> List[Dict[str, Any]]:
+    """
+    Validate an arbitrary object as a list of change specs and normalize paths.
+
+    Returns:
+        A list of validated change specs; invalid entries are dropped silently.
+    """
     if not isinstance(changes, list):
         return []
     prepared = []
@@ -81,7 +95,15 @@ def validate_change_specs(changes: Any) -> List[Dict[str, Any]]:
     return prepared
 
 
+# orion: Validate the strict response expected from the :apply flow before writing to disk.
+
 def validate_apply_response(resp: Dict[str, Any]) -> (bool, str):
+    """
+    Validate the shape of a model-produced apply response prior to applying changes.
+
+    Returns:
+        Tuple of (ok, error_message). error_message is empty on success.
+    """
     required_keys = ["mode", "explanation", "files", "issues"]
     for k in required_keys:
         if k not in resp:
@@ -117,7 +139,10 @@ def validate_apply_response(resp: Dict[str, Any]) -> (bool, str):
 # Tools exposed to the model (definitions)
 # -----------------------------
 
+# orion: Tools include local repo operations and external PD summary accessors; documented for clarity.
+
 def tool_definitions() -> List[Dict[str, Any]]:
+    """Return the list of tool definitions exposed to the model for function-calling."""
     # Local repo tools + external dependency tools
     defs = [
         {
@@ -205,7 +230,18 @@ def tool_definitions() -> List[Dict[str, Any]]:
 
 
 class Orion:
+    """
+    High-level orchestrator for interactive code changes and repository management.
+
+    Responsibilities include:
+      - Managing conversation/history and metadata
+      - Wiring tool registry for function-calling
+      - Refreshing/validating summaries (local files and external PDs)
+      - Building requests to the model and applying file changes safely
+    """
+
     def __init__(self, repo_root: pathlib.Path) -> None:
+        """Initialize Orion with a repository root and supporting services."""
         self.repo_root = repo_root.resolve()
         self.storage = Storage(self.repo_root)
         self.md = self.storage.load_metadata()
@@ -217,7 +253,7 @@ class Orion:
 
         self.ext_root: Optional[pathlib.Path] = ext_dir_valid(ORION_EXTERNAL_DIR)
 
-        # Build tools registry for interactive execution
+        # orion: Build tools registry mapping tool names to callables that capture repo_root and other context.
         self.tools_registry = {
             # Local repo
             "list_paths": lambda ctx, args: tool_list_paths(ctx, self.repo_root, args),
@@ -234,6 +270,7 @@ class Orion:
     # ---------- External tools (flat) ----------
 
     def _tool_list_pds(self, ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool wrapper: list PD filenames from ORION_EXTERNAL_DIR (flat)."""
         if not self.ext_root:
             return {"_meta_error": "ORION_EXTERNAL_DIR not set or invalid.", "_args_echo": args}
         try:
@@ -243,6 +280,7 @@ class Orion:
             return {"_meta_error": f"list_pds failed: {e}", "_args_echo": args}
 
     def _tool_get_pos(self, ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool wrapper: return or (re)generate POS for a given PD filename."""
         if not self.ext_root:
             return {"_meta_error": "ORION_EXTERNAL_DIR not set or invalid.", "_args_echo": args}
         filename = str(args.get("filename") or "")
@@ -262,8 +300,10 @@ class Orion:
 
     def _build_bootstrap_message(self, ctx: Context) -> Dict[str, Any]:
         """
-        Build a one-time bootstrap system message with the complete file list and colocated summaries (if present).
-        Also includes external dependency heads (flat) if ORION_EXTERNAL_DIR is set.
+        Build a one-time bootstrap system message with the full file list and summaries.
+
+        Includes colocated per-file summaries (if present) and lightweight heads
+        for external dependency projects if configured.
         """
         files = list_all_nonignored_files(self.repo_root)
         items = []
@@ -297,8 +337,8 @@ class Orion:
 
     def _ensure_bootstrap_if_new_conversation(self, ctx: Context) -> None:
         """
-        If there is no conversation history file, refresh summaries and persist a bootstrap message.
-        Also ensures external POS are created/validated on first run.
+        If a conversation has not yet started, refresh local/external summaries and
+        persist an initial bootstrap system message for the model.
         """
         if not self.storage.conv_file.exists():
             # Refresh local summaries first (small repo assumption)
@@ -313,6 +353,7 @@ class Orion:
     # ---------- Commands ----------
 
     def cmd_help(self, ctx: Context) -> None:
+        """Print a list of supported commands and brief descriptions."""
         ctx.error_message("Commands:")
         ctx.send_to_user(":preview              - Show pending changes")
         ctx.send_to_user(":apply                - Apply all pending changes")
@@ -325,6 +366,7 @@ class Orion:
         ctx.send_to_user(":quit                 - Exit")
 
     def cmd_preview(self, ctx: Context) -> None:
+        """Display all pending change specs in a human-readable format."""
         changes = self.md["pending_changes"]
         if not changes:
             ctx.send_to_user("No pending changes.")
@@ -337,6 +379,7 @@ class Orion:
                 ctx.send_to_user(f"  * {it['change_type']} {it['path']} — {it['summary_of_change']}")
 
     def cmd_discard_change(self, ctx: Context, change_id: str) -> None:
+        """Remove a single change by id from the pending list and persist metadata."""
         before = len(self.md["pending_changes"])
         self.md["pending_changes"] = [c for c in self.md["pending_changes"] if c.get("id") != change_id]
         after = len(self.md["pending_changes"])
@@ -347,6 +390,12 @@ class Orion:
             ctx.send_to_user(f"Discarded change {change_id}.")
 
     def _refresh_summaries(self, ctx: Context, only_paths: Optional[List[str]] = None) -> None:
+        """
+        Generate or update colocated per-file summaries for files in the repo.
+
+        Args:
+            only_paths: If provided, limit the refresh to this subset of paths.
+        """
         # Determine file list
         if only_paths is not None:
             files = [normalize_path(p) for p in only_paths]
@@ -399,6 +448,7 @@ class Orion:
             ctx.log(f"Summarization complete. Updated {len(changed)} file(s); skipped {skipped} large file(s).")
 
     def cmd_refresh(self, ctx: Context) -> None:
+        """Refresh summaries for local files and external PDs (if configured)."""
         self._refresh_summaries(ctx)
         # Also refresh external dependency POS if configured
         if self.ext_root:
@@ -408,6 +458,7 @@ class Orion:
             ctx.log("Refreshed external dependency Project Orion Summaries.")
 
     def cmd_refresh_deps(self, ctx: Context) -> None:
+        """Refresh Project Orion Summaries for all PDs in ORION_EXTERNAL_DIR (if set)."""
         if not self.ext_root:
             ctx.log("ORION_EXTERNAL_DIR not set or invalid; nothing to refresh.")
             return
@@ -417,6 +468,7 @@ class Orion:
         ctx.log("Refreshed external dependency Project Orion Summaries.")
 
     def cmd_status(self, ctx: Context) -> None:
+        """Print a one-line-per-field status report about the current Orion session and repo."""
         total_files = len(list_all_nonignored_files(self.repo_root))
         dep_count = 0
         if self.ext_root:
@@ -435,6 +487,7 @@ class Orion:
             ctx.send_to_user(f"External PD root: {self.ext_root} (flat). PD files: {dep_count}")
 
     def cmd_consolidate(self, ctx: Context) -> None:
+        """Coalesce duplicate change batches and reset the consolidation counter."""
         changes = self.md["pending_changes"]
         seen = set()
         consolidated = []
@@ -450,12 +503,20 @@ class Orion:
         ctx.log(f"Consolidated. Pending changes now: {len(self.md['pending_changes'])}")
 
     def auto_consolidate_if_needed(self, ctx: Context) -> None:
+        """Perform consolidation automatically every few batches to limit duplication."""
         n = self.md["batches_since_last_consolidation"]
         if n >= 3 and n % 3 == 0:
             ctx.log("Auto-consolidating changes...")
             self.cmd_consolidate(ctx)
 
     def cmd_apply(self, ctx: Context) -> None:
+        """
+        Apply all pending changes by asking the model to produce a file map.
+
+        The model returns a strict JSON payload that is validated before any disk
+        writes occur. On success, files are written, commit log updated, summaries
+        refreshed for touched paths, and the conversation is reset.
+        """
         pending = self.md["pending_changes"]
         if not pending:
             ctx.send_to_user("No pending changes to apply.")
@@ -582,6 +643,9 @@ class Orion:
             ctx.log(f"Added {added_splits} split follow-up change(s) due to LINE_CAP.")
 
     def handle_user_input(self, ctx: Context, text: str) -> None:
+        """
+        Handle a line of user input: either execute a command or advance the conversation.
+        """
         # Commands
         if text.startswith(":"):
             parts = text.strip().split()
@@ -709,6 +773,7 @@ class Orion:
             self.auto_consolidate_if_needed(ctx)
 
     def run(self) -> None:
+        """Start the interactive REPL loop for Orion."""
         print(f"Orion ready at repo root: {self.repo_root}")
         if self.ext_root:
             print(f"External dependency PD root: {self.ext_root} (flat)")
