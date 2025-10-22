@@ -1,4 +1,4 @@
-# orion: Ported the core Orion class, tool definitions, command handlers, bootstrap/summaries flow, and change-spec validators from editor.py into a focused module. Adjusted imports to use the new modular structure.
+# orion: Ported the core Orion class, tool definitions, command handlers, bootstrap/summaries flow, and change-spec validators from editor.py into a focused module. Adjusted imports to use the new modular structure. Externalized conversation/apply system prompts via sutradhar.prompts.get_prompt.
 
 import json
 import pathlib
@@ -27,6 +27,7 @@ from .tools import (
     tool_search_code,
     tool_ask_user,
 )
+from .prompts import get_prompt
 
 
 # -----------------------------
@@ -475,13 +476,8 @@ class Orion:
                     content = ""
             files_payload.append({"path": p, "content": content})
 
-        system_text = (
-            "You are Orion Apply. You will receive the accumulated change specs and the current contents of affected files. "
-            "If you need more context, call tools. Then return a strict JSON object with fields: "
-            "mode ('ok'|'incompatible'), explanation (string), files (array of {path,is_new,code}), issues (array of {reason,paths}). "
-            "Do not include hidden reasoning. For non-applicable arrays, return empty arrays."
-            "Remember to add a comment just before every change you make explaining the reasoning behind the change. Start these comments with `orion:` . If you find a comment already exists at that point update it to reflect your reasoning."
-        )
+        # orion: Load Apply system prompt from resources so it can be maintained externally.
+        system_text = get_prompt("prompt_apply_system.txt")
         user_text = json.dumps({"changes": pending, "files": files_payload}, ensure_ascii=False)
 
         response_schema = {
@@ -629,13 +625,8 @@ class Orion:
         self.storage.append_raw_message({"role": "user", "content": text})
         self.history.append({"role": "user", "content": text})
 
-        # System prompt
-        system_text = (
-            "You are Orion Conversation. Respond with a strict JSON object:\n"
-            "{ assistant_message: string, changes: ChangeSpec[] }\n"
-            "ChangeSpec: { id, title, description, items[] }. ChangeItemSpec: { path, change_type, summary_of_change }.\n"
-            "All fields required; arrays may be empty when not applicable."
-        )
+        # orion: Load Conversation system prompt from resources so it can be maintained externally.
+        system_text = get_prompt("prompt_conversation_system.txt")
 
         response_schema = {
             "type": "object",

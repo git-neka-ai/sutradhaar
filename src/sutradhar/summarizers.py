@@ -1,7 +1,8 @@
-# orion: Moved file and project summarization models and logic into a dedicated module to reuse across Orion features and to keep orion.py focused on control flow.
+# orion: Externalized system prompts to sutradhar.resources loaded via sutradhar.prompts.get_prompt. Also ensured imports are complete for existing logic.
 
 import json
 import pathlib
+import os
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, ValidationError, ConfigDict
@@ -10,6 +11,7 @@ from .config import LINE_CAP, SUMMARY_MAX_BYTES, ORION_DEP_TTL_SEC
 from .context import Context
 from .fs import _safe_abs, count_lines, sha256_bytes, colocated_summary_path
 from .client import ChatCompletionsClient
+from .prompts import get_prompt
 
 
 class CustomBaseModel(BaseModel):
@@ -32,17 +34,6 @@ class FileSummary(CustomBaseModel):
     cfg: List[str] = Field(..., description="List of configs/environment variables used")
     r: List[str] = Field(..., description="List of risks/constraints")
     sm: List[str] = Field(..., description="List of notes on safe-to-modify areas")
-
-
-def summarizer_system_text(line_cap: int) -> str:
-    return (
-        "You are Orion's file summarizer. Produce a highly compressed, machine-oriented summary JSON for a single file.\n"
-        "- Minimize tokens and be lossless for downstream planning.\n"
-        "- Do NOT include code; summarize structure, symbols, imports, configs, side-effects, risks, and safe-to-modify notes.\n"
-        "- Use the strict JSON schema provided.\n"
-        "- language keys: py, ts, tsx, js, jsx, sh.\n"
-        f"- Note: Hard limit: no file may exceed {line_cap} lines in edits (for context only).\n"
-    )
 
 
 def guess_language(path: str) -> str:
@@ -86,7 +77,8 @@ def summarize_file(ctx: Context, client: ChatCompletionsClient, repo_root: pathl
         "sha256": digest,
     }
 
-    system_txt = summarizer_system_text(LINE_CAP)
+    # orion: Load file summarizer system prompt from resources with dynamic line cap.
+    system_txt = get_prompt("prompt_summarizer_file_system.txt", line_cap=LINE_CAP)
     user_txt = json.dumps({"info": info, "content": text}, ensure_ascii=False)
     schema = FileSummary.model_json_schema()
 
@@ -134,16 +126,6 @@ class ProjectOrionSummary(CustomBaseModel):
     r: List[str] = Field(..., description="Risks/constraints (bullets)")
 
 
-def pd_summarizer_system_text() -> str:
-    return (
-        "You are Orion's Project Description summarizer. Produce a compact, machine-oriented project summary JSON.\n"
-        "- Do NOT include code snippets; write textual bullet hints only.\n"
-        "- Capture exported surface (classes/functions/config keys) and short usage notes and risks.\n"
-        "- Use the strict JSON schema provided.\n"
-        "- Keep tokens minimal but sufficient for planning.\n"
-    )
-
-
 def summarize_project_description(
     ctx: Context,
     client: ChatCompletionsClient,
@@ -161,7 +143,8 @@ def summarize_project_description(
     text = data.decode("utf-8", errors="replace")
     info = {"filename": filename, "size_bytes": len(data), "sha256": pd_hash}
 
-    system_txt = pd_summarizer_system_text()
+    # orion: Load PD summarizer system prompt from resources.
+    system_txt = get_prompt("prompt_summarizer_pd_system.txt")
     user_txt = json.dumps({"info": info, "content": text}, ensure_ascii=False)
     schema = ProjectOrionSummary.model_json_schema()
 

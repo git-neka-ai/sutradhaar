@@ -54,3 +54,11 @@ forbidden_modules = []
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+# orion: Configure setuptools to use the src/ layout for package discovery.
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# orion: Ensure resource files (prompts, html) are included in distributions.
+[tool.setuptools.package-data]
+"sutradhar.resources" = ["*.txt", "*.html"]
