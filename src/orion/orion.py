@@ -1,4 +1,4 @@
-# orion: Ported the core Orion class, tool definitions, command handlers, bootstrap/summaries flow, and change-spec validators from editor.py into a focused module. Adjusted imports to use the new modular structure. Externalized conversation/apply system prompts via sutradhar.prompts.get_prompt. Added docstrings and inline comments where flow or validation is non-obvious.
+# orion: Ported the core Orion class, tool definitions, command handlers, bootstrap/summaries flow, and change-spec validators from editor.py into a focused module. Adjusted imports to use the new modular structure. Externalized conversation/apply system prompts via orion.prompts.get_prompt. Added docstrings and inline comments where flow or validation is non-obvious.
 
 import json
 import pathlib

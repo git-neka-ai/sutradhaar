@@ -125,7 +125,7 @@ class ChatCompletionsClient:
         # orion: Work on a local copy of messages to append tool outputs and assistant echoes.
         local_messages = list(messages)
         have_tools = bool(tools)
-        max_tool_turns = 12
+        max_tool_turns = 50
         turns = 0
 
         def _make_payload() -> Dict[str, Any]:
@@ -289,7 +289,7 @@ class ChatCompletionsClient:
 
         # orion: Maintain our own local history to capture tool outputs and assistant tool calls between turns.
         local_messages = list(messages)
-        max_tool_turns = 12
+        max_tool_turns = 100
         turns = 0
 
         def _sink(msg: Dict[str, Any]) -> None:
@@ -297,7 +297,6 @@ class ChatCompletionsClient:
                 message_sink(msg)
 
         while True:
-            ctx.log(f"Calling POST (tools={len(tools) if tools else 0})")
             r = self.session.post(
                 url,
                 json={
@@ -318,6 +317,13 @@ class ChatCompletionsClient:
 
             tool_calls = msg_obj.get("tool_calls") or []
             if tool_calls:
+                ctx.log("Got tool calls:")
+                for tc in tool_calls:
+                    fn = tc.get("function", {}) or {}
+                    name = fn.get("name")
+                    args_text = fn.get("arguments", "{}")
+                    ctx.log(f"- {name}({args_text})")
+                pass
                 # orion: Echo assistant tool_calls and append for context in the next turn.
                 local_messages.append({"role": "assistant", "content": msg_obj.get("content", None), "tool_calls": tool_calls})
                 _sink({"role": "assistant", "content": msg_obj.get("content", None), "tool_calls": tool_calls})
@@ -325,7 +331,7 @@ class ChatCompletionsClient:
                     raise RuntimeError("Tool requested but no interactive_tool_runner provided.")
                 turns += 1
                 if turns > max_tool_turns:
-                    raise RuntimeError("Exceeded max tool-call turns; aborting.")
+                    raise RuntimeError(f"Exceeded max tool-call turns {turns} > {max_tool_turns}; aborting.")
                 for tc in tool_calls:
                     tc_id = tc.get("id")
                     fn = tc.get("function", {}) or {}

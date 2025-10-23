@@ -51,8 +51,9 @@ class Storage:
     def __init__(self, repo_root: pathlib.Path) -> None:
         """Initialize storage with the repository root path."""
         self.repo_root = repo_root
-        self.metadata_file = repo_root / "orion-metadata.json"
-        self.conv_file = repo_root / "orion-conversation.jsonl"
+        self.metadata_file = repo_root / ".orion" / "orion-metadata.json"
+        self.conv_file = repo_root / ".orion" / "orion-conversation.jsonl"
+        self.metadata_file.parent.mkdir(parents=True, exist_ok=True)
 
     # orion: Document the default structure and meaning of keys.
     def default_metadata(self) -> Dict[str, Any]:

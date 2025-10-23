@@ -1,4 +1,4 @@
-# orion: Externalized system prompts to sutradhar.resources loaded via sutradhar.prompts.get_prompt. Also ensured imports are complete for existing logic. Added docstrings and inline comments to clarify size limits, schema enforcement, and regeneration TTLs.
+# orion: Externalized system prompts to orion.resources loaded via orion.prompts.get_prompt. Also ensured imports are complete for existing logic. Added docstrings and inline comments to clarify size limits, schema enforcement, and regeneration TTLs.
 
 import json
 import pathlib

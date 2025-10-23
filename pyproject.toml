@@ -3,16 +3,20 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sutradhar"
+name = "sutradhaar"
 version = "0.1.0"
 description = "Python code editor"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+# orion: Declare runtime dependencies so shiv installs them when packaging a .pyz.
+dependencies = [
+  "requests>=2.31,<3",
+  "pydantic>=2,<3",
+]
 
 # CLI entry points (optional; add one per module bootstrap)
 [project.scripts]
-sutradhar = "sutradhar.main:main"
+orion = "orion.main:main"
 
 [tool.ruff]
 target-version = "py311"
@@ -24,7 +28,7 @@ select = ["E", "F", "B", "I", "N"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["sutradhar"]
+known-first-party = ["orion"]
 combine-as-imports = true
 
 [tool.mypy]
@@ -42,13 +46,13 @@ root_package = "."
 [[tool.importlinter.contracts]]
 name = "Layered modules"
 type = "layers"
-layers = ["sutradhar"]
+layers = ["orion"]
 
 # Example: forbid cross-module internal imports
 [[tool.importlinter.contracts]]
 name = "No internal leakage"
 type = "forbidden"
-source_modules = ["sutradhar"]
+source_modules = ["orion"]
 forbidden_modules = []
 
 [tool.pytest.ini_options]
@@ -61,4 +65,4 @@ where = ["src"]
 
 # orion: Ensure resource files (prompts, html) are included in distributions.
 [tool.setuptools.package-data]
-"sutradhar.resources" = ["*.txt", "*.html"]
+"orion.resources" = ["*.txt", "*.html"]
