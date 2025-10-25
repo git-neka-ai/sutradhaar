@@ -29,6 +29,15 @@ from .tools import (
 )
 from .prompts import get_prompt
 
+# orion: Import centralized Pydantic models and validation utilities; this replaces ad-hoc schema dicts.
+from pydantic import ValidationError, TypeAdapter
+from .models import (
+    ConversationResponse,
+    ApplyResponse,
+    ChangeSpec,
+    ChangeItem,
+)
+
 
 # -----------------------------
 # Strict schemas and change-spec helpers
@@ -55,84 +64,25 @@ def make_change_item(path: str, change_type: str, summary_of_change: str) -> Dic
     return {"path": normalize_path(path), "change_type": change_type, "summary_of_change": summary_of_change}
 
 
-# orion: Validate and normalize a list of change specs provided by the model.
+# orion: Simplify validators by delegating to Pydantic models; retained as thin wrappers for compatibility.
 
 def validate_change_specs(changes: Any) -> List[Dict[str, Any]]:
-    """
-    Validate an arbitrary object as a list of change specs and normalize paths.
-
-    Returns:
-        A list of validated change specs; invalid entries are dropped silently.
-    """
-    if not isinstance(changes, list):
+    """Validate a list of change specs using Pydantic and return normalized dicts."""
+    try:
+        parsed: List[ChangeSpec] = TypeAdapter(List[ChangeSpec]).validate_python(changes)
+    except ValidationError:
         return []
-    prepared = []
-    for ch in changes:
-        if not isinstance(ch, dict):
-            continue
-        required_keys = ["id", "title", "description", "items"]
-        if any(k not in ch for k in required_keys):
-            continue
-        items = ch.get("items", [])
-        if not isinstance(items, list):
-            continue
-        ok_items = True
-        for it in items:
-            if not isinstance(it, dict):
-                ok_items = False
-                break
-            if any(ik not in it for ik in ["path", "change_type", "summary_of_change"]):
-                ok_items = False
-                break
-            if it.get("change_type") not in ["modify", "create", "delete", "move", "rename"]:
-                ok_items = False
-                break
-        if not ok_items:
-            continue
-        for it in items:
-            it["path"] = normalize_path(it["path"])
-        prepared.append({"id": ch["id"], "title": ch["title"], "description": ch["description"], "items": items})
-    return prepared
+    # Ensure enum values are dumped as strings and paths are normalized via model validators.
+    return [c.model_dump() for c in parsed]
 
-
-# orion: Validate the strict response expected from the :apply flow before writing to disk.
 
 def validate_apply_response(resp: Dict[str, Any]) -> (bool, str):
-    """
-    Validate the shape of a model-produced apply response prior to applying changes.
-
-    Returns:
-        Tuple of (ok, error_message). error_message is empty on success.
-    """
-    required_keys = ["mode", "explanation", "files", "issues"]
-    for k in required_keys:
-        if k not in resp:
-            return False, f"ApplyResponse missing required field: {k}"
-    if resp["mode"] not in ["ok", "incompatible"]:
-        return False, "ApplyResponse.mode must be 'ok' or 'incompatible'"
-    if not isinstance(resp["explanation"], str):
-        return False, "ApplyResponse.explanation must be string"
-    if not isinstance(resp["files"], list) or not isinstance(resp["issues"], list):
-        return False, "ApplyResponse.files and issues must be arrays"
-    for f in resp["files"]:
-        for fk in ["path", "is_new", "code"]:
-            if fk not in f:
-                return False, f"ApplyResponse.files item missing field: {fk}"
-        if not isinstance(f["path"], str):
-            return False, "file.path must be string"
-        if not isinstance(f["is_new"], bool):
-            return False, "file.is_new must be boolean"
-        if not isinstance(f["code"], str):
-            return False, "file.code must be string"
-    for issue in resp["issues"]:
-        for ik in ["reason", "paths"]:
-            if ik not in issue:
-                return False, f"Issue missing field: {ik}"
-        if not isinstance(issue["reason"], str):
-            return False, "issue.reason must be string"
-        if not isinstance(issue["paths"], list) or not all(isinstance(p, str) for p in issue["paths"]):
-            return False, "issue.paths must be array of strings"
-    return True, ""
+    """Validate ApplyResponse shape using Pydantic; returns (ok, error)."""
+    try:
+        ApplyResponse.model_validate(resp)
+        return True, ""
+    except ValidationError as e:
+        return False, str(e)
 
 
 # -----------------------------
@@ -332,6 +282,7 @@ class Orion:
         bootstrap_msg = self._build_bootstrap_message(ctx, pending_changes)
         if ( self.history == [] ) or ( self.history[0].get("type") != "orion_bootstrap" ):
             self.storage.append_raw_message(bootstrap_msg)
+            self.history.insert(0, bootstrap_msg)
         else:
             self.history[0] = bootstrap_msg
 
@@ -526,33 +477,8 @@ class Orion:
         system_text = get_prompt("prompt_apply_system.txt")
         user_text = json.dumps({"changes": pending, "files": files_payload}, ensure_ascii=False)
 
-        response_schema = {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "mode": {"type": "string", "enum": ["ok", "incompatible"]},
-                "explanation": {"type": "string"},
-                "files": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {"path": {"type": "string"}, "is_new": {"type": "boolean"}, "code": {"type": "string"}},
-                        "required": ["path", "is_new", "code"],
-                    },
-                },
-                "issues": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {"reason": {"type": "string"}, "paths": {"type": "array", "items": {"type": "string"}}},
-                        "required": ["reason", "paths"],
-                    },
-                },
-            },
-            "required": ["mode", "explanation", "files", "issues"],
-        }
+        # orion: Replace inline JSON Schema with centralized Pydantic model schema.
+        response_schema = ApplyResponse.model_json_schema()
 
         tools = tool_definitions()
 
@@ -564,7 +490,7 @@ class Orion:
 
         messages = [{"role": "system", "content": system_text}, {"role": "user", "content": user_text}]
         ctx.log("Calling model to apply changes...")
-        # orion: Migrate :apply flow to Responses API; pass reasoning_effort="minimal" and preserve tool runner for function calls.
+        # orion: Migrate :apply flow to Responses API using Pydantic schema; tool runner preserved.
         final_json = self.client.call_responses(
             ctx,
             messages,
@@ -573,30 +499,33 @@ class Orion:
             interactive_tool_runner=runner,
             call_type="apply",
         )
-        ok, err = validate_apply_response(final_json)
-        if not ok:
-            ctx.error_message(f"Apply failed: invalid response from model: {err}")
+
+        # orion: Parse and validate with Pydantic; surface helpful error messages on failure.
+        try:
+            parsed = ApplyResponse.model_validate(final_json)
+        except ValidationError as e:
+            ctx.error_message(f"Apply failed: invalid response from model: {e}")
             return
 
-        if final_json["mode"] == "incompatible":
+        if parsed.mode == "incompatible":
             ctx.send_to_user("Model reported incompatibility:")
-            for issue in final_json["issues"]:
-                ctx.send_to_user(f"- {issue['reason']}: {', '.join(issue['paths'])}")
-            ctx.send_to_user(f"Explanation: {final_json['explanation']}")
+            for issue in parsed.issues:
+                ctx.send_to_user(f"- {issue.reason}: {', '.join(issue.paths)}")
+            ctx.send_to_user(f"Explanation: {parsed.explanation}")
             return
 
         # Write files
         written_paths: List[str] = []
-        for f in final_json["files"]:
-            write_file(self.repo_root, f["path"], f["code"])
-            written_paths.append(f["path"])
+        for f in parsed.files:
+            write_file(self.repo_root, f.path, f.code)
+            written_paths.append(f.path)
 
         # Commit log entry
         self.md["plan_state"]["commit_log"].append(
-            {"id": short_id("commit"), "ts": now_ts(), "paths": [f["path"] for f in final_json["files"]], "explanation": final_json["explanation"]}
+            {"id": short_id("commit"), "ts": now_ts(), "paths": [f.path for f in parsed.files], "explanation": parsed.explanation}
         )
         self.storage.save_metadata(self.md)
-        ctx.log(f"Wrote {len(final_json['files'])} files. Explanation: {final_json['explanation']}")
+        ctx.log(f"Wrote {len(parsed.files)} files. Explanation: {parsed.explanation}")
 
         # Refresh summaries for written files (including brand-new files)
         if written_paths:
@@ -612,10 +541,10 @@ class Orion:
 
         # Post-apply LINE_CAP follow-ups
         added_splits = 0
-        for f in final_json["files"]:
-            lines = count_lines(f["code"])
+        for f in parsed.files:
+            lines = count_lines(f.code)
             if lines > LINE_CAP:
-                path = f["path"]
+                path = f.path
                 stem = pathlib.Path(path).stem
                 ext = pathlib.Path(path).suffix
                 target2 = normalize_path(str(pathlib.Path(path).with_name(f"{stem}_part2{ext}")))
@@ -685,40 +614,8 @@ class Orion:
         # orion: Load Conversation system prompt from resources so it can be maintained externally.
         system_text = get_prompt("prompt_conversation_system.txt")
 
-        response_schema = {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "assistant_message": {"type": "string"},
-                "changes": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "id": {"type": "string"},
-                            "title": {"type": "string"},
-                            "description": {"type": "string"},
-                            "items": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "additionalProperties": False,
-                                    "properties": {
-                                        "path": {"type": "string"},
-                                        "change_type": {"type": "string", "enum": ["modify", "create", "delete", "move", "rename"]},
-                                        "summary_of_change": {"type": "string"},
-                                    },
-                                    "required": ["path", "change_type", "summary_of_change"],
-                                },
-                            },
-                        },
-                        "required": ["id", "title", "description", "items"],
-                    },
-                },
-            },
-            "required": ["assistant_message", "changes"],
-        }
+        # orion: Replace inline JSON Schema with centralized Pydantic model schema.
+        response_schema = ConversationResponse.model_json_schema()
 
         # Rebuild messages: prepend conversation system prompt, then replay full stored history verbatim
         messages = [{"type": "message", "role": "system", "content": system_text}]
@@ -742,7 +639,7 @@ class Orion:
             self.history.append(msg)
 
         ctx.log("Calling model for conversation response...")
-        # orion: Migrate conversation flow to Responses API; include message sink and set call_type="conversation" to match migration plan.
+        # orion: Migrate conversation flow to Responses API; include message sink and set call_type="conversation".
         final_json = self.client.call_responses(
             ctx,
             messages,
@@ -753,11 +650,15 @@ class Orion:
             call_type="conversation",
         )
 
-        if "assistant_message" not in final_json or "changes" not in final_json:
+        # orion: Parse with Pydantic models, then convert to plain dicts for storage.
+        try:
+            parsed = ConversationResponse.model_validate(final_json)
+        except ValidationError:
             ctx.log("Model returned invalid conversation response.")
             return
-        assistant_msg = final_json["assistant_message"]
-        changes = validate_change_specs(final_json["changes"])
+
+        assistant_msg = parsed.assistant_message
+        changes = [c.model_dump() for c in parsed.changes]
         ctx.send_to_user(assistant_msg)
         self.storage.append_raw_message({"type":"message", "role": "assistant", "content": assistant_msg})
         self.history.append({"type":"message", "role": "assistant", "content": assistant_msg})

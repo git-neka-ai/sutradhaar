@@ -12,30 +12,7 @@ from .context import Context
 from .fs import _safe_abs, count_lines, sha256_bytes, colocated_summary_path
 from .client import ChatCompletionsClient
 from .prompts import get_prompt
-
-
-class CustomBaseModel(BaseModel):
-    """Pydantic base model configured to forbid unknown fields for strict validation."""
-    model_config = ConfigDict(extra="forbid")
-
-
-class FileSummary(CustomBaseModel):
-    """Compact per-file summary optimized for LLM consumption (token minimized)."""
-    # Compact keys
-    v: int = Field(..., description="Schema version - use 1")
-    p: str = Field(..., description="File path")
-    b: str = Field(..., description="Working-tree sha256 digest")
-    l: str = Field(..., description="Language of the file")
-    lc: int = Field(..., description="Line count")
-    sz: int = Field(..., description="Size in bytes")
-    ex: List[str] = Field(..., description="List of exports/symbols")
-    im: List[str] = Field(..., description="List of imports/dependencies")
-    fx: List[str] = Field(..., description="List of functions")
-    cl: List[str] = Field(..., description="List of classes")
-    io: List[str] = Field(..., description="List of side effects")
-    cfg: List[str] = Field(..., description="List of configs/environment variables used")
-    r: List[str] = Field(..., description="List of risks/constraints")
-    sm: List[str] = Field(..., description="List of notes on safe-to-modify areas")
+from .models import CustomBaseModel, FileSummary
 
 
 # orion: Add a small heuristic docstring for language detection.
