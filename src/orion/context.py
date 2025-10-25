@@ -115,11 +115,12 @@ class Storage:
     # orion: Existing docstring retained; clarify that this preserves raw tool_call structures for exact replay.
     def append_raw_message(self, msg: Dict[str, Any]) -> None:
         """
-        Append a raw chat message to the conversation log. Message must include 'role'.
-        We preserve additional fields (tool_calls, tool_call_id, etc.) for replay.
+        Append a raw chat message to the conversation log. Message either be an input with a role and content or a function_call or function_call_output.
+        
         """
-        if "role" not in msg:
-            raise ValueError("append_raw_message requires a message with a 'role' field")
+        _type = msg.get("type")
+        if _type not in ("message", "function_call", "function_call_output"):
+            raise ValueError("append_raw_message requires a message of type 'message', 'function_call', or 'function_call_output'")
         entry = dict(msg)
         entry.setdefault("ts", now_ts())
         append_jsonl(self.conv_file, entry)

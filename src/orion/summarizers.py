@@ -113,7 +113,7 @@ def summarize_file(ctx: Context, client: ChatCompletionsClient, repo_root: pathl
         response_schema=schema,
         max_completion_tokens=None,
         interactive_tool_runner=None,
-        reasoning_effort="minimal",
+        call_type="file_summary",
     )
 
     try:
@@ -146,7 +146,7 @@ class ProjectOrionSummary(CustomBaseModel):
     r: List[str] = Field(..., description="Risks/constraints (bullets)")
 
 
-# orion: Document the PD summarization flow and the use of Chat Completions for this schema.
+# orion: Document the PD summarization flow and migrate to the Responses API to unify endpoints with file summarizer.
 
 def summarize_project_description(
     ctx: Context,
@@ -189,13 +189,15 @@ def summarize_project_description(
     ]
 
     ctx.log(f"Summarizing Project Description: {filename} (size: {len(data)} bytes)")
-    final_json = client.call_chatcompletions(
+    # orion: Use Responses API with minimal reasoning to standardize all LLM invocations.
+    final_json = client.call_responses(
         ctx,
         messages=messages,
         tools=None,
         response_schema=schema,
         max_completion_tokens=None,
         interactive_tool_runner=None,
+        call_type="project_summary",
     )
 
     try:

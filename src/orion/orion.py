@@ -147,56 +147,44 @@ def tool_definitions() -> List[Dict[str, Any]]:
     defs = [
         {
             "type": "function",
-            "function": {
-                "name": "list_paths",
-                "description": "List repository files; optionally filter by glob.",
-                "parameters": {"type": "object", "properties": {"glob": {"type": "string"}}, "required": [], "additionalProperties": False},
+            "name": "list_paths",
+            "description": "List repository files; optionally filter by glob.",
+            "parameters": {"type": "object", "properties": {"glob": {"type": "string"}}, "required": [], "additionalProperties": False},
+        },
+        {
+            "type": "function",
+            "name": "get_file_contents",
+            "description": "Return full contents for a file.",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False},
+        },
+        {
+            "type": "function",
+            "name": "get_file_snippet",
+            "description": "Return a line-range snippet for a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}},
+                "required": ["path", "start_line", "end_line"],
+                "additionalProperties": False,
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "get_file_contents",
-                "description": "Return full contents for a file.",
-                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False},
-            },
+            "name": "get_summary",
+            "description": "Return a brief machine-oriented summary for a local repo file, if available.",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False},
         },
         {
             "type": "function",
-            "function": {
-                "name": "get_file_snippet",
-                "description": "Return a line-range snippet for a file.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}},
-                    "required": ["path", "start_line", "end_line"],
-                    "additionalProperties": False,
-                },
-            },
+            "name": "search_code",
+            "description": "Search files for a substring; returns paths.",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["query"], "additionalProperties": False},
         },
         {
             "type": "function",
-            "function": {
-                "name": "get_summary",
-                "description": "Return a brief machine-oriented summary for a local repo file, if available.",
-                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "search_code",
-                "description": "Search files for a substring; returns paths.",
-                "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["query"], "additionalProperties": False},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "ask_user",
-                "description": "Ask the user for a clarification.",
-                "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"], "additionalProperties": False},
-            },
+            "name": "ask_user",
+            "description": "Ask the user for a clarification.",
+            "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"], "additionalProperties": False},
         },
     ]
 
@@ -205,19 +193,15 @@ def tool_definitions() -> List[Dict[str, Any]]:
         [
             {
                 "type": "function",
-                "function": {
-                    "name": "list_project_descriptions",
-                    "description": "List dependency Project Descriptions (filenames) from the external directory.",
-                    "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
-                },
+                "name": "list_project_descriptions",
+                "description": "List dependency Project Descriptions (filenames) from the external directory.",
+                "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
             },
             {
                 "type": "function",
-                "function": {
-                    "name": "get_project_orion_summary",
-                    "description": "Return the Project Orion Summary (POS) for a given PD filename; regenerates if stale.",
-                    "parameters": {"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"], "additionalProperties": False},
-                },
+                "name": "get_project_orion_summary",
+                "description": "Return the Project Orion Summary (POS) for a given PD filename; regenerates if stale.",
+                "parameters": {"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"], "additionalProperties": False},
             },
         ]
     )
@@ -298,7 +282,7 @@ class Orion:
 
     # ---------- Bootstrap helpers ----------
 
-    def _build_bootstrap_message(self, ctx: Context) -> Dict[str, Any]:
+    def _build_bootstrap_message(self, ctx: Context, pending_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Build a one-time bootstrap system message with the full file list and summaries.
 
@@ -320,9 +304,10 @@ class Orion:
 
         payload: Dict[str, Any] = {
             "type": "orion_bootstrap",
-            "note": "This is the complete list of files in the repository at this time; treat it as authoritative.",
+            "note": "This is the complete list of files in the repository at this time; treat it as authoritative.And these are the complete list of pending changes.",
             "complete_list": True,
             "files": items,
+            "pending_changes": pending_changes,
         }
 
         # External dependency heads (filenames + small counts)
@@ -333,22 +318,22 @@ class Orion:
                 heads = []
             payload["dependency_projects"] = heads
 
-        return {"role": "system", "content": json.dumps(payload, ensure_ascii=False)}
+        return {"type":"message","role": "system", "content": json.dumps(payload, ensure_ascii=False)}
 
-    def _ensure_bootstrap_if_new_conversation(self, ctx: Context) -> None:
+    def _ensure_bootstrap(self, ctx: Context, pending_changes: List[Dict[str, Any]]) -> None:
         """
         If a conversation has not yet started, refresh local/external summaries and
         persist an initial bootstrap system message for the model.
         """
-        if not self.storage.conv_file.exists():
-            # Refresh local summaries first (small repo assumption)
-            self._refresh_summaries(ctx)
-            # Ensure external POS (if configured)
-            if self.ext_root:
-                ensure_all_pos(ctx, self.ext_root, self.client)
-            bootstrap_msg = self._build_bootstrap_message(ctx)
+        self._refresh_summaries(ctx)
+        # Ensure external POS (if configured)
+        if self.ext_root:
+            ensure_all_pos(ctx, self.ext_root, self.client)
+        bootstrap_msg = self._build_bootstrap_message(ctx, pending_changes)
+        if ( self.history == [] ) or ( self.history[0].get("type") != "orion_bootstrap" ):
             self.storage.append_raw_message(bootstrap_msg)
-            self.history.append(bootstrap_msg)
+        else:
+            self.history[0] = bootstrap_msg
 
     # ---------- Commands ----------
 
@@ -579,7 +564,15 @@ class Orion:
 
         messages = [{"role": "system", "content": system_text}, {"role": "user", "content": user_text}]
         ctx.log("Calling model to apply changes...")
-        final_json = self.client.call_chatcompletions(ctx, messages, tools, response_schema, interactive_tool_runner=runner)
+        # orion: Migrate :apply flow to Responses API; pass reasoning_effort="minimal" and preserve tool runner for function calls.
+        final_json = self.client.call_responses(
+            ctx,
+            messages,
+            tools,
+            response_schema,
+            interactive_tool_runner=runner,
+            call_type="apply",
+        )
         ok, err = validate_apply_response(final_json)
         if not ok:
             ctx.error_message(f"Apply failed: invalid response from model: {err}")
@@ -683,11 +676,11 @@ class Orion:
             return
 
         # New conversation bootstrap if needed (no history file present)
-        self._ensure_bootstrap_if_new_conversation(ctx)
+        self._ensure_bootstrap(ctx,self.md["pending_changes"])
 
         # Append user turn (raw)
-        self.storage.append_raw_message({"role": "user", "content": text})
-        self.history.append({"role": "user", "content": text})
+        self.storage.append_raw_message({"type": "message", "role": "user", "content": text})
+        self.history.append({"type": "message", "role": "user", "content": text})
 
         # orion: Load Conversation system prompt from resources so it can be maintained externally.
         system_text = get_prompt("prompt_conversation_system.txt")
@@ -728,15 +721,11 @@ class Orion:
         }
 
         # Rebuild messages: prepend conversation system prompt, then replay full stored history verbatim
-        messages = [{"role": "system", "content": system_text}]
+        messages = [{"type": "message", "role": "system", "content": system_text}]
         for h in self.history:
-            msg: Dict[str, Any] = {"role": h["role"]}
-            if "content" in h:
-                msg["content"] = h["content"]
-            if "tool_calls" in h:
-                msg["tool_calls"] = h["tool_calls"]
-            if "tool_call_id" in h:
-                msg["tool_call_id"] = h["tool_call_id"]
+            msg = h.copy()
+            if "ts" in msg:
+                del msg["ts"]
             messages.append(msg)
 
         tools = tool_definitions()
@@ -753,8 +742,15 @@ class Orion:
             self.history.append(msg)
 
         ctx.log("Calling model for conversation response...")
-        final_json = self.client.call_chatcompletions(
-            ctx, messages, tools, response_schema, interactive_tool_runner=runner, message_sink=sink
+        # orion: Migrate conversation flow to Responses API; include message sink and set call_type="conversation" to match migration plan.
+        final_json = self.client.call_responses(
+            ctx,
+            messages,
+            tools,
+            response_schema,
+            interactive_tool_runner=runner,
+            message_sink=sink,
+            call_type="conversation",
         )
 
         if "assistant_message" not in final_json or "changes" not in final_json:
@@ -763,8 +759,8 @@ class Orion:
         assistant_msg = final_json["assistant_message"]
         changes = validate_change_specs(final_json["changes"])
         ctx.send_to_user(assistant_msg)
-        self.storage.append_history("assistant", assistant_msg, {"changes_count": len(changes)})
-        self.history.append({"role": "assistant", "content": assistant_msg})
+        self.storage.append_raw_message({"type":"message", "role": "assistant", "content": assistant_msg})
+        self.history.append({"type":"message", "role": "assistant", "content": assistant_msg})
 
         if changes:
             self.md["pending_changes"].extend(changes)
