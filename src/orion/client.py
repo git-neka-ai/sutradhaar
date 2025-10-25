@@ -8,6 +8,29 @@ import requests
 from .config import MAX_COMPLETION_TOKENS
 from .context import Context
 
+from copy import deepcopy
+from pydantic import BaseModel
+
+def clean_invalid_ref_nodes(schema: dict) -> dict:
+    """Recursively remove sibling keys alongside `$ref` for OpenAI compatibility."""
+    def _clean(node):
+        if isinstance(node, dict):
+            if "$ref" in node:
+                # Only keep the `$ref`
+                for key in list(node.keys()):
+                    if key != "$ref":
+                        node.pop(key, None)
+            else:
+                for value in node.values():
+                    _clean(value)
+        elif isinstance(node, list):
+            for value in node:
+                _clean(value)
+    cleaned = deepcopy(schema)
+    _clean(cleaned)
+    return cleaned
+
+
 
 class ChatCompletionsClient:
     # orion: Updated client to indicate Responses-only usage; Chat Completions helpers were removed during cleanup.
@@ -74,6 +97,7 @@ class ChatCompletionsClient:
                 exceeding the max tool-call loop turns.
         """
         reasoning_effort = "minimal" if call_type.endswith("_summary") else "medium"
+        response_schema = clean_invalid_ref_nodes(response_schema)
 
         # Build a stable, normalized sink so we don't branch on None repeatedly.
         def _sink(msg: Dict[str, Any]) -> None:

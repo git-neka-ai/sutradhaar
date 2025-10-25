@@ -248,10 +248,48 @@ def read_bytes(repo_root: pathlib.Path, path: str) -> bytes:
         return f.read()
 
 
-# orion: Enumerate repo files while pruning git/.orion and internal metadata; also honors .orionignore rules.
+# orion: Prefer Git for file discovery so .gitignore is respected; fall back to os.walk. Always drop Orion internal files and honor .orionignore.
 
 def list_repo_paths(repo_root: pathlib.Path) -> List[str]:
-    """Walk the working tree and return non-ignored repo-relative file paths (POSIX)."""
+    """Return non-ignored repo-relative file paths (POSIX).
+
+    Behavior:
+      - If inside a Git work tree and Git commands succeed, use:
+          git ls-files -z --exclude-standard --others --cached
+        This respects .gitignore automatically and returns tracked plus
+        untracked-but-unignored files.
+      - Regardless of source, filter out Orion internal files/dirs and then
+        apply .orionignore rules via _is_ignored_rel.
+      - If Git is unavailable or fails, fall back to an os.walk that prunes
+        .git and .orion directories, and then applies .orionignore.
+    """
+    # orion: Prefer Git for parity with developer workflows and to respect .gitignore out of the box; gracefully degrade to a filesystem walk if Git is not usable.
+    rc, out, _ = run_git(["rev-parse", "--is-inside-work-tree"], repo_root)
+
+    def _is_internal(p: str) -> bool:
+        # Skip runtime metadata and any file inside a .orion directory
+        if p.endswith("orion-metadata.json") or p.endswith("orion-conversation.jsonl"):
+            return True
+        return ".orion" in pathlib.Path(p).parts
+
+    if rc == 0 and out.strip() == "true":
+        rc_ls, out_ls, _err_ls = run_git(
+            ["ls-files", "-z", "--exclude-standard", "--others", "--cached"],
+            repo_root,
+        )
+        if rc_ls == 0:
+            git_paths = [p for p in out_ls.split("\x00") if p]
+            results: List[str] = []
+            for rel in git_paths:
+                if _is_internal(rel):
+                    continue
+                rel_posix = normalize_path(rel)
+                if _is_ignored_rel(repo_root, rel_posix):
+                    continue
+                results.append(rel_posix)
+            return sorted(results)
+
+    # Fallback: filesystem walk
     paths: List[str] = []
     for root, dirs, files in os.walk(repo_root):
         # prune .git and any colocated .orion directories
