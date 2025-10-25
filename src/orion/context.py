@@ -104,7 +104,7 @@ class Storage:
             hist = hist[-CONV_CAP_TURNS:]
         return hist
 
-    # orion: Document convenience wrapper for appending a common shape (role/content plus timestamp).
+    # orion: Document convenience wrapper for appending a common shape (role/content plus timestamp). 
     def append_history(self, role: str, content: str, extra: Optional[Dict[str, Any]] = None) -> None:
         """Append a simple role/content entry to the JSONL conversation history."""
         entry = {"ts": now_ts(), "role": role, "content": content}

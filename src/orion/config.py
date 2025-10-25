@@ -1,4 +1,4 @@
-# orion: Extracted environment-driven configuration constants from editor.py to a dedicated module to centralize settings and allow other modules to import them without circular dependencies.
+# orion: Centralize configuration constants; removed ORION_EXTERNAL_DIR (external PD directory is now provided exclusively via CLI --external-dir/-e). Other env-based settings remain unchanged.
 
 import os
 
@@ -18,10 +18,6 @@ CONV_CAP_TURNS = int(os.environ.get("ORION_CONV_CAP_TURNS", "200"))
 # Summaries max bytes
 SUMMARY_MAX_BYTES = int(os.environ.get("ORION_SUMMARY_MAX_BYTES", str(2_000_000)))  # 2 MB default
 
-# External dependency projects (flat directory, no subfolders)
-# This is the root folder containing Project Descriptions (PDs) as files,
-# and a .orion/ subfolder containing Project Orion Summaries (POS) named <filename>.json
-ORION_EXTERNAL_DIR = os.environ.get("ORION_EXTERNAL_DIR", "").strip()
-
+# orion: Keep POS TTL as an environment-driven knob; this remains independent of how the external directory is provided.
 # Optional: TTL in seconds to force POS regeneration even if hash matches (omit/0 to disable)
 ORION_DEP_TTL_SEC = int(os.environ.get("ORION_DEP_TTL_SEC", "0") or "0")

@@ -72,7 +72,7 @@ class ChatCompletionsClient:
         model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Invoke the Responses API and normalize the result into a strict JSON object.
+        Invoke the Responses API and normalize the result into a strict JSON object. 
 
         The method enforces a strict json_schema for the final assistant content,
         supports function-calling via the tools argument, and iteratively handles
@@ -169,6 +169,50 @@ class ChatCompletionsClient:
             content = "\n".join([c for c in content_chunks if isinstance(c, str)]) if content_chunks else None
             return {"content": content, "tool_calls": tool_calls}
 
+        # orion: Log token usage for every Responses API call; supports multiple schema variants for robustness.
+        def _log_usage(resp_obj: Dict[str, Any]) -> None:
+            usage = resp_obj.get("usage") or {}
+
+            def _as_int(v: Any) -> int:
+                try:
+                    return int(v) if v is not None else 0
+                except Exception:
+                    return 0
+
+            # Prefer Responses fields, fall back to Chat Completions aliases
+            input_tokens = usage.get("input_tokens")
+            if input_tokens is None:
+                input_tokens = usage.get("prompt_tokens")
+
+            output_tokens = usage.get("output_tokens")
+            if output_tokens is None:
+                output_tokens = usage.get("completion_tokens")
+
+            # Cached input tokens may appear in several places
+            cached_input = None
+            itd = usage.get("input_token_details") or {}
+            ptd = usage.get("prompt_tokens_details") or {}
+            for cand in (
+                itd.get("cached_tokens"),
+                ptd.get("cached_tokens"),
+                usage.get("cache_read_input_tokens"),
+            ):
+                if cand is not None:
+                    cached_input = cand
+                    break
+
+            input_tokens_i = _as_int(input_tokens)
+            output_tokens_i = _as_int(output_tokens)
+            cached_input_i = _as_int(cached_input)
+
+            try:
+                ctx.log(
+                    f"OpenAI usage: input_tokens={input_tokens_i}, cached_input_tokens={cached_input_i}, output_tokens={output_tokens_i}"
+                )
+            except Exception:
+                # Best-effort logging; never fail the request loop
+                pass
+
         while True:
             # orion: Conservative timeout to accommodate tool loops; Responses may stream chunks server-side.
             r = self.session.post(url, json=_make_payload(), timeout=240)
@@ -177,6 +221,9 @@ class ChatCompletionsClient:
                 raise RuntimeError(f"Responses API error {r.status_code}: {r.text[:2000]}")
 
             resp = r.json()
+
+            # orion: Log token usage for this call using robust parsing of usage fields.
+            _log_usage(resp)
 
             # orion: Normalize the Responses payload into a chat-like message object for unified downstream handling.
             msg_obj = _extract_msg_obj(resp)
@@ -262,4 +309,3 @@ def dumpHttpFile(file: str, url: str, method: str, headers: Dict[str, str], obj:
         print(f"Error: The object could not be serialized to JSON. Details: {e}")
     except OSError as e:
         print(f"Error: Could not write to file {file}. Details: {e}")
-

@@ -109,17 +109,6 @@ def tool_definitions() -> List[Dict[str, Any]]:
         },
         {
             "type": "function",
-            "name": "get_file_snippet",
-            "description": "Return a line-range snippet for a file.",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}},
-                "required": ["path", "start_line", "end_line"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "type": "function",
             "name": "get_summary",
             "description": "Return a brief machine-oriented summary for a local repo file, if available.",
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False},
@@ -174,18 +163,22 @@ class Orion:
       - Building requests to the model and applying file changes safely
     """
 
-    def __init__(self, repo_root: pathlib.Path) -> None:
-        """Initialize Orion with a repository root and supporting services."""
+    def __init__(self, repo_root: pathlib.Path, external_dir: Optional[str] = None) -> None:
+        """Initialize Orion with a repository root and supporting services.
+
+        Args:
+            repo_root: Absolute or relative path to the repository root.
+            external_dir: Optional path to the external Project Descriptions directory (flat). When None or invalid,
+                          external dependency features are disabled. Provided via CLI --external-dir/-e.
+        """
         self.repo_root = repo_root.resolve()
         self.storage = Storage(self.repo_root)
         self.md = self.storage.load_metadata()
         self.history = self.storage.load_history()
         self.client = ChatCompletionsClient(OPENAI_API_KEY, AI_MODEL)
 
-        # External dependency root (flat)
-        from .config import ORION_EXTERNAL_DIR
-
-        self.ext_root: Optional[pathlib.Path] = ext_dir_valid(ORION_EXTERNAL_DIR)
+        # orion: Resolve the external dependency root from the CLI-provided value only (environment variable removed).
+        self.ext_root: Optional[pathlib.Path] = ext_dir_valid(external_dir)
 
         # orion: Build tools registry mapping tool names to callables that capture repo_root and other context.
         self.tools_registry = {
@@ -204,9 +197,9 @@ class Orion:
     # ---------- External tools (flat) ----------
 
     def _tool_list_pds(self, ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool wrapper: list PD filenames from ORION_EXTERNAL_DIR (flat)."""
+        """Tool wrapper: list PD filenames from the external directory (flat)."""
         if not self.ext_root:
-            return {"_meta_error": "ORION_EXTERNAL_DIR not set or invalid.", "_args_echo": args}
+            return {"_meta_error": "external directory not set or invalid.", "_args_echo": args}
         try:
             items = list_project_descriptions(self.ext_root)
             return {"filenames": items, "_args_echo": args}
@@ -216,7 +209,7 @@ class Orion:
     def _tool_get_pos(self, ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool wrapper: return or (re)generate POS for a given PD filename."""
         if not self.ext_root:
-            return {"_meta_error": "ORION_EXTERNAL_DIR not set or invalid.", "_args_echo": args}
+            return {"_meta_error": "external directory not set or invalid.", "_args_echo": args}
         filename = str(args.get("filename") or "")
         if not filename:
             return {"_meta_error": "filename required", "_args_echo": args}
@@ -394,9 +387,9 @@ class Orion:
             ctx.log("Refreshed external dependency Project Orion Summaries.")
 
     def cmd_refresh_deps(self, ctx: Context) -> None:
-        """Refresh Project Orion Summaries for all PDs in ORION_EXTERNAL_DIR (if set)."""
+        """Refresh Project Orion Summaries for all PDs in the external directory (if set)."""
         if not self.ext_root:
-            ctx.log("ORION_EXTERNAL_DIR not set or invalid; nothing to refresh.")
+            ctx.log("External directory not set or invalid; nothing to refresh.")
             return
         from .summarizers import ensure_all_pos
 
@@ -675,7 +668,7 @@ class Orion:
         if self.ext_root:
             print(f"External dependency PD root: {self.ext_root} (flat)")
         else:
-            print("External dependency PD root not set (ORION_EXTERNAL_DIR unset or invalid).")
+            print("External dependency PD root not set (use --external-dir to enable).")
         print("Type :help for commands.")
         ctx = Context()
         while True:

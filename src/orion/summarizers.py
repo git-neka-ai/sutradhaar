@@ -118,7 +118,7 @@ class ProjectOrionSummary(CustomBaseModel):
     v: int = Field(..., description="Schema version - use 1")
     f: str = Field(..., description="Project Description filename")
     h: str = Field(..., description="sha256 digest of PD raw bytes")
-    ex: List[Any] = Field(..., description="Exported surface (classes/functions/config handles)")
+    ex: List[str] = Field(..., description="Exported surface (classes/functions/config handles)")
     u: List[str] = Field(..., description="Usage notes/hints (bullets; no code)")
     r: List[str] = Field(..., description="Risks/constraints (bullets)")
 
