@@ -12,7 +12,7 @@ def get_prompt(name: str, **kwargs) -> str:
     raw text without attempting formatting to avoid accidental brace handling in
     prompts that show JSON examples.
     """
-    data = resources.files("orion.resources").joinpath(name).read_text(encoding="utf-8")
+    data = resources.files("orion.workbench.resources").joinpath(name).read_text(encoding="utf-8")
     if kwargs:
         return data.format(**kwargs)
     return data
