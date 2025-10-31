@@ -9,7 +9,8 @@ from pydantic import BaseModel, Field, ValidationError, ConfigDict
 
 from .config import LINE_CAP, SUMMARY_MAX_BYTES, ORION_DEP_TTL_SEC
 from .context import Context
-from .fs import _safe_abs, count_lines, sha256_bytes, colocated_summary_path
+# orion: Import is_ignored_path and write_file to enforce .orionignore on reads/writes for summaries.
+from .fs import _safe_abs, count_lines, sha256_bytes, colocated_summary_path, is_ignored_path, write_file
 from .client import ChatCompletionsClient
 from .prompts import get_prompt
 from .models import CustomBaseModel, FileSummary
@@ -47,6 +48,12 @@ def summarize_file(ctx: Context, client: ChatCompletionsClient, repo_root: pathl
         Parsed summary object on success; None on failure or skip.
     """
     abs_path = _safe_abs(repo_root, rel_path)
+
+    # orion: Respect .orionignore — skip summarization entirely if the source path is ignored.
+    if is_ignored_path(repo_root, rel_path):
+        ctx.log(f"Skipping summary for ignored path: {rel_path}")
+        return None
+
     # Skip very large files
     try:
         size_bytes = abs_path.stat().st_size
@@ -104,10 +111,19 @@ def summarize_file(ctx: Context, client: ChatCompletionsClient, repo_root: pathl
     obj["b"] = digest
 
     sp = colocated_summary_path(repo_root, rel_path)
-    sp.parent.mkdir(parents=True, exist_ok=True)
-    with sp.open("w", encoding="utf-8") as f:
-        # orion: Compact separators reduce on-disk size and token load during bootstrap.
-        f.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    # orion: Avoid persisting under ignored summary paths (e.g., ignored directories); honor .orionignore for targets too.
+    if is_ignored_path(repo_root, sp):
+        ctx.log(f"Skipping summary write for ignored target path: {sp.relative_to(repo_root).as_posix()}")
+        return obj
+
+    # orion: Route writes through fs.write_file to enforce .orionignore and create parents; compact separators minimize on-disk size.
+    rel_summary_path = sp.relative_to(repo_root).as_posix()
+    write_file(
+        repo_root,
+        rel_summary_path,
+        json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n",
+    )
 
     return obj
 

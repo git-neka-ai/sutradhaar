@@ -100,7 +100,7 @@ def _orionignore_path(repo_root: pathlib.Path) -> pathlib.Path:
     """Return the absolute .orionignore path inside repo_root."""
     return (repo_root / ".orionignore").resolve()
 
-# orion: Parse .orionignore lines into a list of (negated, glob_pattern) tuples using Path.match-compatible semantics.
+# orion: Parse .orionignore rules and emit dual glob variants for non-rooted entries to match both repo root and any subpath; keep rooted semantics and negations. Update docstring to explain last-match-wins.
 
 def _parse_orionignore_patterns(text: str) -> List[Tuple[bool, str]]:
     """
@@ -108,9 +108,13 @@ def _parse_orionignore_patterns(text: str) -> List[Tuple[bool, str]]:
 
     Rules:
       - Empty lines and comments (#) are ignored.
-      - Lines starting with '!' negate the ignore (unignore).
-      - Leading '/' anchors to repo root; omitted '/' matches anywhere (via **/).
-      - Trailing '/' targets directories (we expand to dir/**).
+      - Lines starting with '!' negate the ignore (unignore); negations participate like normal rules.
+      - A leading '/' anchors the rule to repo root (single glob emitted).
+      - Without a leading '/', emit two globs so the rule matches both at the repo root and at any depth:
+          * For directory rules (trailing '/'): '{dir}/**' and '**/{dir}/**'
+          * For non-directory rules: '{pat}' and '**/{pat}'
+      - A trailing '/' targets directories (we expand to dir/**).
+      - Matching uses pathlib.PurePosixPath.match; last matching rule wins.
     """
     patterns: List[Tuple[bool, str]] = []
     for raw in text.splitlines():
@@ -129,17 +133,28 @@ def _parse_orionignore_patterns(text: str) -> List[Tuple[bool, str]]:
         dir_only = line.endswith("/")
         if dir_only:
             line = line.rstrip("/")
-        # Build a Path.match-compatible glob
+        # orion: Build Path.match-compatible patterns. For non-rooted rules, emit dual variants for top-level and any-depth matches; preserve single-pattern behavior for rooted rules.
         pat = line
-        if dir_only:
-            # Match anything inside the directory
-            pat = f"{pat}/**"
         if rooted:
-            glob_pat = pat
+            if dir_only:
+                # orion: Rooted directory rule anchors to repo root only (single '{dir}/**' pattern).
+                patterns.append((negated, f"{pat}/**"))
+            else:
+                # orion: Rooted non-directory rule anchors to repo root only.
+                patterns.append((negated, pat))
         else:
-            # Allow match anywhere in the tree
-            glob_pat = f"**/{pat}" if pat else "**"
-        patterns.append((negated, glob_pat))
+            if dir_only:
+                # orion: Non-rooted directory rule matches both top-level and any-depth directories of that name.
+                top = f"{pat}/**" if pat else "**"
+                deep = f"**/{pat}/**" if pat else "**"
+            else:
+                # orion: Non-rooted file/pattern rule matches both top-level and any-depth occurrences.
+                top = pat if pat else "**"
+                deep = f"**/{pat}" if pat else "**"
+            # orion: Emit top-level variant first, then any-depth variant; avoid duplicates when patterns coincide.
+            patterns.append((negated, top))
+            if deep != top:
+                patterns.append((negated, deep))
     return patterns
 
 # orion: Load and cache .orionignore patterns, invalidating cache on file mtime changes.

@@ -496,6 +496,7 @@ class Orion:
             response_schema,
             interactive_tool_runner=runner,
             call_type="apply",
+            _timeout=3000,
         )
 
         # orion: Parse and validate with Pydantic; surface helpful error messages on failure.

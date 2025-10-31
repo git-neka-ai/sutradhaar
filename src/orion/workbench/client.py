@@ -70,6 +70,7 @@ class ChatCompletionsClient:
         message_sink=None,
         call_type: str = "minimal",
         model: Optional[str] = None,
+        _timeout: int = 240,
     ) -> Dict[str, Any]:
         """
         Invoke the Responses API and normalize the result into a strict JSON object. 
@@ -215,7 +216,7 @@ class ChatCompletionsClient:
 
         while True:
             # orion: Conservative timeout to accommodate tool loops; Responses may stream chunks server-side.
-            r = self.session.post(url, json=_make_payload(), timeout=240)
+            r = self.session.post(url, json=_make_payload(), timeout=_timeout)
             if r.status_code != 200:
                 # orion: Surface first 2KB of body for fast diagnostics without overwhelming logs.
                 raise RuntimeError(f"Responses API error {r.status_code}: {r.text[:2000]}")
