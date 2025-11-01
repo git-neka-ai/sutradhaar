@@ -254,7 +254,7 @@ class Orion:
             "list_paths": lambda ctx, args: tool_list_paths(ctx, self.repo_root, args),
             "get_file_contents": lambda ctx, args: tool_get_file_contents(ctx, self.repo_root, args),
             "get_file_snippet": lambda ctx, args: tool_get_file_snippet(ctx, self.repo_root, args),
-            "get_summary": lambda ctx, args: tool_get_summary(ctx, self, args),
+            "get_summary": lambda ctx, args: tool_get_summary(ctx, self.repo_root, args),
             "search_code": lambda ctx, args: tool_search_code(ctx, self.repo_root, args),
             "ask_user": lambda ctx, args: tool_ask_user(ctx, args),
             # External dependencies (flat)
@@ -761,7 +761,7 @@ class Orion:
         else:
             print("External dependency PD root not set (use --external-dir to enable).")
         print("Type :help for commands.")
-        ctx = Context()
+        ctx = Context(self.repo_root)
         while True:
             try:
                 text = input("> ").strip()

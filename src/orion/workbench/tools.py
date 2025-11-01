@@ -13,10 +13,10 @@ def _wrap_tool_result(args: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
 
 
 # orion: Add docstring and mention optional glob filtering.
-def tool_list_paths(ctx: Context, repo_root: pathlib.Path, args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_list_paths(ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
     """Return a list of repo-relative paths, optionally filtered by a glob/query pattern."""
     query = args.get("glob") or args.get("query")
-    paths = list_repo_paths(repo_root)
+    paths = list_repo_paths(ctx.repo_root)
     if query:
         import fnmatch
         paths = [p for p in paths if fnmatch.fnmatch(p, query)]
@@ -26,11 +26,11 @@ def tool_list_paths(ctx: Context, repo_root: pathlib.Path, args: Dict[str, Any])
 
 # orion: Document path normalization and return shape (includes line_count for quick context).
 
-def tool_get_file_contents(ctx: Context, repo_root: pathlib.Path, args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_get_file_contents(ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
     """Return full UTF-8 contents for a file plus line count, or a _meta_error on failure."""
     path = normalize_path(args.get("path", ""))
     try:
-        content = read_file(repo_root, path)
+        content = read_file(ctx.repo_root, path)
     except Exception:
         return _wrap_tool_result(args, {"_meta_error": f"Could not read {path}"})
     # orion: Wrap successful payload in standard envelope.
@@ -39,13 +39,13 @@ def tool_get_file_contents(ctx: Context, repo_root: pathlib.Path, args: Dict[str
 
 # orion: Add docstring and guard/adjust the requested range into valid bounds for the file.
 
-def tool_get_file_snippet(ctx: Context, repo_root: pathlib.Path, args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_get_file_snippet(ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
     """Return a [start_line, end_line] inclusive snippet; adjusts bounds to the file size."""
     path = normalize_path(args.get("path", ""))
     start_line = int(args.get("start_line", 1))
     end_line = int(args.get("end_line", start_line + 200))
     try:
-        content = read_file(repo_root, path)
+        content = read_file(ctx.repo_root, path)
     except Exception:
         return _wrap_tool_result(args, {"_meta_error": f"Could not read {path}"})
     lines = content.splitlines()
@@ -58,12 +58,12 @@ def tool_get_file_snippet(ctx: Context, repo_root: pathlib.Path, args: Dict[str,
 
 # orion: Document that summaries are read only from colocated .orion files, not generated on demand.
 
-def tool_get_summary(ctx: Context, orion: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_get_summary(ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
     """Return a colocated per-file summary if present; otherwise a _meta_error."""
     # Return summary for a file from the colocated .orion path only.
     path = normalize_path(args.get("path", ""))
     try:
-        sp = colocated_summary_path(orion.repo_root, path)
+        sp = colocated_summary_path(ctx.repo_root, path)
         if sp.exists():
             with sp.open("r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -76,16 +76,16 @@ def tool_get_summary(ctx: Context, orion: Any, args: Dict[str, Any]) -> Dict[str
 
 # orion: Document linear scan behavior and case-insensitive search; cap results for performance.
 
-def tool_search_code(ctx: Context, repo_root: pathlib.Path, args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_search_code(ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
     """Search all non-ignored files for a substring; returns up to max_results path matches."""
     query = str(args.get("query", "") or "")
     if not query:
         return _wrap_tool_result(args, {"matches": []})
     matches: List[Dict[str, Any]] = []
-    paths = list_repo_paths(repo_root)
+    paths = list_repo_paths(ctx.repo_root)
     for p in paths:
         try:
-            content = read_file(repo_root, p)
+            content = read_file(ctx.repo_root, p)
         except Exception:
             continue
         lower = content.lower()

@@ -18,9 +18,9 @@ class Context:
     """
 
     # orion: Add trivial docstring for completeness and future extension.
-    def __init__(self) -> None:
+    def __init__(self, repo_root: pathlib.Path) -> None:
         """Initialize a default console-based context."""
-        pass
+        self.repo_root = repo_root
 
     # orion: Clarify side-effect: prints to stdout.
     def send_to_user(self, message: str) -> None:
