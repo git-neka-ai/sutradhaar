@@ -1,4 +1,4 @@
-# orion: Moved CLI entrypoint from editor.py into a dedicated module. Updated to parse --external-dir/-e and remove ORION_EXTERNAL_DIR env usage; external dependencies are enabled only when the flag is provided.
+# orion: Introduce reflective tool discovery for internal tools and a generic runner that injects/strips reason_for_call. Replace manual tool registry and reason-aware tools with reflection-based specs and typed external wrappers.
 
 import pathlib
 import sys
@@ -24,14 +24,8 @@ from .fs import (
     short_id,
 )
 from .summarizers import ensure_all_pos, summarize_file
-from .tools import (
-    tool_list_paths,
-    tool_get_file_contents,
-    tool_get_file_snippet,
-    tool_get_summary,
-    tool_search_code,
-    tool_ask_user,
-)
+# orion: Switch to reflective tool utilities; individual tool functions are no longer imported or wired here.
+from .tools import discover_tools, list_tool_names, run_tool
 from .prompts import get_prompt
 
 # orion: Import centralized Pydantic models and validation utilities; this replaces ad-hoc schema dicts.
@@ -94,125 +88,40 @@ def validate_apply_response(resp: Dict[str, Any]) -> (bool, str):
 # Tools exposed to the model (definitions)
 # -----------------------------
 
-# orion: Updated tools to require a reason_for_call string parameter for every tool and to expose get_file_snippet. This standardizes intent logging and ensures all wired tools share the same contract.
+# orion: Provide external dependency tool schemas; internal tools are discovered via reflection and get a synthetic reason_for_call injected solely in their model schema.
 
-def tool_definitions() -> List[Dict[str, Any]]:
-    """Return the list of tool definitions exposed to the model for function-calling."""
-    # Local repo tools + external dependency tools
-    defs = [
+def _external_tool_definitions() -> List[Dict[str, Any]]:
+    return [
         {
             "type": "function",
-            "name": "list_paths",
-            "description": "List repository files; optionally filter by glob.",
-            # orion: Add reason_for_call (required) to standardize the contract.
+            "name": "list_project_descriptions",
+            "description": "List dependency Project Descriptions (filenames) from the external directory.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "glob": {"type": "string"},
+                    # orion: Synthetic reason_for_call is exposed to the model but stripped before invocation.
                     "reason_for_call": {"type": "string"},
                 },
-                "required": ["reason_for_call"],
+                "required": [],
                 "additionalProperties": False,
             },
         },
         {
             "type": "function",
-            "name": "get_file_contents",
-            "description": "Return full contents for a file.",
-            # orion: Require both path and reason_for_call.
+            "name": "get_project_orion_summary",
+            "description": "Return the Project Orion Summary (POS) for a given PD filename; regenerates if stale.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "filename": {"type": "string"},
+                    # orion: Synthetic reason_for_call for consistency with internal tools.
                     "reason_for_call": {"type": "string"},
                 },
-                "required": ["path", "reason_for_call"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "type": "function",
-            "name": "get_summary",
-            "description": "Return a brief machine-oriented summary for a local repo file, if available.",
-            # orion: Require path and reason_for_call.
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "reason_for_call": {"type": "string"},
-                },
-                "required": ["path", "reason_for_call"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "type": "function",
-            "name": "search_code",
-            "description": "Search files for a substring; returns paths.",
-            # orion: Require query and reason_for_call; max_results is optional.
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "max_results": {"type": "integer"},
-                    "reason_for_call": {"type": "string"},
-                },
-                "required": ["query", "reason_for_call"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "type": "function",
-            "name": "ask_user",
-            "description": "Ask the user for a clarification.",
-            # orion: Require prompt and reason_for_call.
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "prompt": {"type": "string"},
-                    "reason_for_call": {"type": "string"},
-                },
-                "required": ["prompt", "reason_for_call"],
+                "required": ["filename"],
                 "additionalProperties": False,
             },
         },
     ]
-
-    # External dependency tools (flat directory)
-    defs.extend(
-        [
-            {
-                "type": "function",
-                "name": "list_project_descriptions",
-                "description": "List dependency Project Descriptions (filenames) from the external directory.",
-                # orion: Require reason_for_call for external tools as well.
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "reason_for_call": {"type": "string"},
-                    },
-                    "required": ["reason_for_call"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "get_project_orion_summary",
-                "description": "Return the Project Orion Summary (POS) for a given PD filename; regenerates if stale.",
-                # orion: Require filename and reason_for_call.
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "filename": {"type": "string"},
-                        "reason_for_call": {"type": "string"},
-                    },
-                    "required": ["filename", "reason_for_call"],
-                    "additionalProperties": False,
-                },
-            },
-        ]
-    )
-    return defs
 
 
 # -----------------------------
@@ -248,70 +157,37 @@ class Orion:
         # orion: Resolve the external dependency root from the CLI-provided value only (environment variable removed).
         self.ext_root: Optional[pathlib.Path] = ext_dir_valid(external_dir)
 
-        # orion: Build tools registry mapping tool names to callables that capture repo_root and other context.
-        self.tools_registry = {
-            # Local repo
-            "list_paths": lambda ctx, args: tool_list_paths(ctx, self.repo_root, args),
-            "get_file_contents": lambda ctx, args: tool_get_file_contents(ctx, self.repo_root, args),
-            "get_file_snippet": lambda ctx, args: tool_get_file_snippet(ctx, self.repo_root, args),
-            "get_summary": lambda ctx, args: tool_get_summary(ctx, self.repo_root, args),
-            "search_code": lambda ctx, args: tool_search_code(ctx, self.repo_root, args),
-            "ask_user": lambda ctx, args: tool_ask_user(ctx, args),
-            # External dependencies (flat)
-            "list_project_descriptions": lambda ctx, args: self._tool_list_pds(ctx, args),
-            "get_project_orion_summary": lambda ctx, args: self._tool_get_pos(ctx, args),
-        }
+        # orion: Discover internal tools reflectively and keep a name set for dispatch.
+        self.internal_tool_specs = discover_tools()
+        self.internal_tool_names = set(list_tool_names())
 
     # ---------- External tools (flat) ----------
 
-    def _tool_list_pds(self, ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool wrapper: list PD filenames from the external directory (flat)."""
-        # orion: Wrap all tool returns in the standard envelope {reason_for_call, result} and move auxiliary fields into result.
-        reason = str(args.get("reason_for_call") or "")
+    def _tool_list_pds(self, ctx: Context) -> Dict[str, Any]:
+        """List PD filenames from the external directory (flat). Raw payload; no envelopes here."""
         if not self.ext_root:
-            return {
-                "reason_for_call": reason,
-                "result": {"_meta_error": "external directory not set or invalid.", "_args_echo": args},
-            }
+            return {"_meta_error": "external directory not set or invalid."}
         try:
             items = list_project_descriptions(self.ext_root)
-            return {"reason_for_call": reason, "result": {"filenames": items, "_args_echo": args}}
+            return {"filenames": items}
         except Exception as e:
-            return {
-                "reason_for_call": reason,
-                "result": {"_meta_error": f"list_pds failed: {e}", "_args_echo": args},
-            }
+            return {"_meta_error": f"list_pds failed: {e}"}
 
-    def _tool_get_pos(self, ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool wrapper: return or (re)generate POS for a given PD filename."""
-        # orion: Wrap in standard envelope and echo args only inside result; include errors in result.
-        reason = str(args.get("reason_for_call") or "")
+    def _tool_get_pos(self, ctx: Context, filename: str) -> Dict[str, Any]:
+        """Return or (re)generate POS for a given PD filename. Raw payload; no envelopes here."""
         if not self.ext_root:
-            return {
-                "reason_for_call": reason,
-                "result": {"_meta_error": "external directory not set or invalid.", "_args_echo": args},
-            }
-        filename = str(args.get("filename") or "")
+            return {"_meta_error": "external directory not set or invalid."}
         if not filename:
-            return {"reason_for_call": reason, "result": {"_meta_error": "filename required", "_args_echo": args}}
+            return {"_meta_error": "filename required"}
         try:
             from .summarizers import ensure_pos
 
             pos = ensure_pos(ctx, self.ext_root, filename, self.client)
             if not pos:
-                return {
-                    "reason_for_call": reason,
-                    "result": {"_meta_error": f"no POS available for {filename}", "_args_echo": args},
-                }
-            return {
-                "reason_for_call": reason,
-                "result": {"filename": filename, "summary": pos, "_args_echo": args},
-            }
+                return {"_meta_error": f"no POS available for {filename}"}
+            return {"filename": filename, "summary": pos}
         except Exception as e:
-            return {
-                "reason_for_call": reason,
-                "result": {"_meta_error": f"get_pos failed for {filename}: {e}", "_args_echo": args},
-            }
+            return {"_meta_error": f"get_pos failed for {filename}: {e}"}
 
     # ---------- Bootstrap helpers ----------
 
@@ -563,13 +439,26 @@ class Orion:
         # orion: Replace inline JSON Schema with centralized Pydantic model schema.
         response_schema = ApplyResponse.model_json_schema()
 
-        tools = tool_definitions()
+        # orion: Build tools from reflective internal specs + explicit external PD specs.
+        tools = []
+        tools.extend(self.internal_tool_specs)
+        tools.extend(_external_tool_definitions())
 
         def runner(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-            fn = self.tools_registry.get(name)
-            if not fn:
-                return {"_meta_error": f"unknown tool {name}", "_args_echo": args}
-            return fn(ctx, args)
+            # orion: Generic runner that injects/strips reason_for_call and returns a wrapped result.
+            reason = str(args.get("reason_for_call") or "")
+            if name in self.internal_tool_names:
+                # Internal: defer to reflection runner which returns the envelope already.
+                return run_tool(ctx, name, args)
+            # External tools: call typed wrappers and wrap result.
+            if name == "list_project_descriptions":
+                payload = self._tool_list_pds(ctx)
+                return {"reason_for_call": reason, "result": payload}
+            if name == "get_project_orion_summary":
+                filename = str(args.get("filename") or "")
+                payload = self._tool_get_pos(ctx, filename)
+                return {"reason_for_call": reason, "result": payload}
+            return {"reason_for_call": reason, "result": {"_meta_error": f"unknown tool {name}", "_args_echo": args}}
 
         messages = [{"role": "system", "content": system_text}, {"role": "user", "content": user_text}]
         ctx.log("Calling model to apply changes...")
@@ -709,13 +598,24 @@ class Orion:
                 del msg["ts"]
             messages.append(msg)
 
-        tools = tool_definitions()
+        # orion: Build tools from reflective internal specs + explicit external PD specs.
+        tools = []
+        tools.extend(self.internal_tool_specs)
+        tools.extend(_external_tool_definitions())
 
         def runner(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-            fn = self.tools_registry.get(name)
-            if not fn:
-                return {"_meta_error": f"unknown tool {name}", "_args_echo": args}
-            return fn(ctx, args)
+            # orion: Generic runner that injects/strips reason_for_call and returns a wrapped result.
+            reason = str(args.get("reason_for_call") or "")
+            if name in self.internal_tool_names:
+                return run_tool(ctx, name, args)
+            if name == "list_project_descriptions":
+                payload = self._tool_list_pds(ctx)
+                return {"reason_for_call": reason, "result": payload}
+            if name == "get_project_orion_summary":
+                filename = str(args.get("filename") or "")
+                payload = self._tool_get_pos(ctx, filename)
+                return {"reason_for_call": reason, "result": payload}
+            return {"reason_for_call": reason, "result": {"_meta_error": f"unknown tool {name}", "_args_echo": args}}
 
         # Sink to persist assistant/tool messages during the call
         def sink(msg: Dict[str, Any]) -> None:
