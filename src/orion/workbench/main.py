@@ -94,7 +94,7 @@ def validate_apply_response(resp: Dict[str, Any]) -> (bool, str):
 # Tools exposed to the model (definitions)
 # -----------------------------
 
-# orion: Tools include local repo operations and external PD summary accessors; documented for clarity.
+# orion: Updated tools to require a reason_for_call string parameter for every tool and to expose get_file_snippet. This standardizes intent logging and ensures all wired tools share the same contract.
 
 def tool_definitions() -> List[Dict[str, Any]]:
     """Return the list of tool definitions exposed to the model for function-calling."""
@@ -104,31 +104,77 @@ def tool_definitions() -> List[Dict[str, Any]]:
             "type": "function",
             "name": "list_paths",
             "description": "List repository files; optionally filter by glob.",
-            "parameters": {"type": "object", "properties": {"glob": {"type": "string"}}, "required": [], "additionalProperties": False},
+            # orion: Add reason_for_call (required) to standardize the contract.
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "glob": {"type": "string"},
+                    "reason_for_call": {"type": "string"},
+                },
+                "required": ["reason_for_call"],
+                "additionalProperties": False,
+            },
         },
         {
             "type": "function",
             "name": "get_file_contents",
             "description": "Return full contents for a file.",
-            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False},
+            # orion: Require both path and reason_for_call.
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "reason_for_call": {"type": "string"},
+                },
+                "required": ["path", "reason_for_call"],
+                "additionalProperties": False,
+            },
         },
         {
             "type": "function",
             "name": "get_summary",
             "description": "Return a brief machine-oriented summary for a local repo file, if available.",
-            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False},
+            # orion: Require path and reason_for_call.
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "reason_for_call": {"type": "string"},
+                },
+                "required": ["path", "reason_for_call"],
+                "additionalProperties": False,
+            },
         },
         {
             "type": "function",
             "name": "search_code",
             "description": "Search files for a substring; returns paths.",
-            "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["query"], "additionalProperties": False},
+            # orion: Require query and reason_for_call; max_results is optional.
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer"},
+                    "reason_for_call": {"type": "string"},
+                },
+                "required": ["query", "reason_for_call"],
+                "additionalProperties": False,
+            },
         },
         {
             "type": "function",
             "name": "ask_user",
             "description": "Ask the user for a clarification.",
-            "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"], "additionalProperties": False},
+            # orion: Require prompt and reason_for_call.
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "reason_for_call": {"type": "string"},
+                },
+                "required": ["prompt", "reason_for_call"],
+                "additionalProperties": False,
+            },
         },
     ]
 
@@ -139,13 +185,30 @@ def tool_definitions() -> List[Dict[str, Any]]:
                 "type": "function",
                 "name": "list_project_descriptions",
                 "description": "List dependency Project Descriptions (filenames) from the external directory.",
-                "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+                # orion: Require reason_for_call for external tools as well.
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason_for_call": {"type": "string"},
+                    },
+                    "required": ["reason_for_call"],
+                    "additionalProperties": False,
+                },
             },
             {
                 "type": "function",
                 "name": "get_project_orion_summary",
                 "description": "Return the Project Orion Summary (POS) for a given PD filename; regenerates if stale.",
-                "parameters": {"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"], "additionalProperties": False},
+                # orion: Require filename and reason_for_call.
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {"type": "string"},
+                        "reason_for_call": {"type": "string"},
+                    },
+                    "required": ["filename", "reason_for_call"],
+                    "additionalProperties": False,
+                },
             },
         ]
     )
@@ -203,30 +266,52 @@ class Orion:
 
     def _tool_list_pds(self, ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool wrapper: list PD filenames from the external directory (flat)."""
+        # orion: Wrap all tool returns in the standard envelope {reason_for_call, result} and move auxiliary fields into result.
+        reason = str(args.get("reason_for_call") or "")
         if not self.ext_root:
-            return {"_meta_error": "external directory not set or invalid.", "_args_echo": args}
+            return {
+                "reason_for_call": reason,
+                "result": {"_meta_error": "external directory not set or invalid.", "_args_echo": args},
+            }
         try:
             items = list_project_descriptions(self.ext_root)
-            return {"filenames": items, "_args_echo": args}
+            return {"reason_for_call": reason, "result": {"filenames": items, "_args_echo": args}}
         except Exception as e:
-            return {"_meta_error": f"list_pds failed: {e}", "_args_echo": args}
+            return {
+                "reason_for_call": reason,
+                "result": {"_meta_error": f"list_pds failed: {e}", "_args_echo": args},
+            }
 
     def _tool_get_pos(self, ctx: Context, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool wrapper: return or (re)generate POS for a given PD filename."""
+        # orion: Wrap in standard envelope and echo args only inside result; include errors in result.
+        reason = str(args.get("reason_for_call") or "")
         if not self.ext_root:
-            return {"_meta_error": "external directory not set or invalid.", "_args_echo": args}
+            return {
+                "reason_for_call": reason,
+                "result": {"_meta_error": "external directory not set or invalid.", "_args_echo": args},
+            }
         filename = str(args.get("filename") or "")
         if not filename:
-            return {"_meta_error": "filename required", "_args_echo": args}
+            return {"reason_for_call": reason, "result": {"_meta_error": "filename required", "_args_echo": args}}
         try:
             from .summarizers import ensure_pos
 
             pos = ensure_pos(ctx, self.ext_root, filename, self.client)
             if not pos:
-                return {"_meta_error": f"no POS available for {filename}", "_args_echo": args}
-            return {"filename": filename, "summary": pos, "_args_echo": args}
+                return {
+                    "reason_for_call": reason,
+                    "result": {"_meta_error": f"no POS available for {filename}", "_args_echo": args},
+                }
+            return {
+                "reason_for_call": reason,
+                "result": {"filename": filename, "summary": pos, "_args_echo": args},
+            }
         except Exception as e:
-            return {"_meta_error": f"get_pos failed for {filename}: {e}", "_args_echo": args}
+            return {
+                "reason_for_call": reason,
+                "result": {"_meta_error": f"get_pos failed for {filename}: {e}", "_args_echo": args},
+            }
 
     # ---------- Bootstrap helpers ----------
 
