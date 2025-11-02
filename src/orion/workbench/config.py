@@ -5,6 +5,8 @@ import os
 # OpenAI env (Chat Completions / Responses)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 AI_MODEL = os.environ.get("AI_MODEL", "gpt-5")  # OpenAI model id
+# orion: Add AI_IMAGE_SUMMARY_MODEL to configure a vision-capable model for image summarization (defaults to gpt-4o).
+AI_IMAGE_SUMMARY_MODEL = os.environ.get("AI_IMAGE_SUMMARY_MODEL", "gpt-5")
 
 # Output token budget
 MAX_COMPLETION_TOKENS = int(os.environ.get("ORION_MAX_COMPLETION_TOKENS", "48192"))

@@ -4,10 +4,13 @@ import json
 import pathlib
 import os
 from typing import Any, Dict, List, Optional
+# orion: Needed for building base64 data URLs for image summarization.
+import base64
 
 from pydantic import BaseModel, Field, ValidationError, ConfigDict
 
-from .config import LINE_CAP, SUMMARY_MAX_BYTES, ORION_DEP_TTL_SEC
+# orion: Import LINE_CAP for code prompts, SUMMARY_MAX_BYTES for size gating, ORION_DEP_TTL_SEC for PD TTLs, and AI_IMAGE_SUMMARY_MODEL for vision routing.
+from .config import LINE_CAP, SUMMARY_MAX_BYTES, ORION_DEP_TTL_SEC, AI_IMAGE_SUMMARY_MODEL
 from .context import Context
 # orion: Import is_ignored_path and write_file to enforce .orionignore on reads/writes for summaries.
 from .fs import _safe_abs, count_lines, sha256_bytes, colocated_summary_path, is_ignored_path, write_file
@@ -22,7 +25,7 @@ from .models import CustomBaseModel, CodeSummary, InfoSummary, HtmlSummary, CssS
 def guess_language(path: str) -> str:
     """Guess a short language tag from a filename suffix (defaults to 'info')."""
     ext = pathlib.Path(path).suffix.lower()
-    # orion: Extend heuristic to cover html/info/css and common config/text types for hybrid routing.
+    # orion: Extend heuristic to cover html/info/css and common config/text types for hybrid routing, and add image types for vision summarization.
     return {
         ".py": "py",
         ".ts": "ts",
@@ -44,7 +47,39 @@ def guess_language(path: str) -> str:
         ".toml": "info",
         ".ini": "info",
         ".css": "css",
+        # orion: Treat common raster formats as images for the dedicated vision summarizer.
+        ".png": "image",
+        ".jpg": "image",
+        ".jpeg": "image",
+        ".webp": "image",
+        ".gif": "image",
+        ".bmp": "image",
+        ".tiff": "image",
+        ".tif": "image",
+        ".heic": "image",
+        ".heif": "image",
+        ".avif": "image",
     }.get(ext, "info")
+
+
+# orion: Map filename extensions to image MIME types for data URLs used by the vision model.
+
+def image_mime_for_extension(path: str) -> str:
+    # orion: Map common image filename extensions to MIME types; default to application/octet-stream as fallback.
+    ext = pathlib.Path(path).suffix.lower()
+    return {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp",
+        ".tiff": "image/tiff",
+        ".tif": "image/tiff",
+        ".heic": "image/heic",
+        ".heif": "image/heif",
+        ".avif": "image/avif",
+    }.get(ext, "application/octet-stream")
 
 
 # orion: Document summarization flow, including size cap, schema validation, and colocated output.
@@ -93,6 +128,64 @@ def summarize_file(ctx: Context, client: ChatCompletionsClient, repo_root: pathl
         "size_bytes": len(data),
         "sha256": digest,
     }
+
+    # orion: Image branch — build a base64 data URL and use a vision-capable model to return strict InfoSummary {"s": "..."}.
+    if language_tag == "image":
+        system_txt = get_prompt("prompt_summarizer_image_system.txt")
+        schema = InfoSummary.model_json_schema()
+        model_cls = InfoSummary
+
+        mime = image_mime_for_extension(rel_path)
+        b64 = base64.b64encode(data).decode("ascii")
+        data_url = f"data:{mime};base64,{b64}"
+
+        messages = [
+            {"role": "system", "content": system_txt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": json.dumps({"info": info}, ensure_ascii=False)},
+                    {"type": "input_image", "image_url": data_url},
+                ],
+            },
+        ]
+
+        ctx.log(f"Summarizing image file: {rel_path} (size: {len(data)} bytes, mime: {mime})")
+        final_json = client.call_responses(
+            ctx,
+            messages=messages,
+            tools=None,
+            response_schema=schema,
+            max_completion_tokens=None,
+            interactive_tool_runner=None,
+            call_type="image_summary",
+            model=AI_IMAGE_SUMMARY_MODEL,
+        )
+
+        try:
+            validated = model_cls.model_validate(final_json)
+        except ValidationError as ve:
+            ctx.error_message(f"Summary validation failed for {rel_path}: {ve}")
+            return None
+
+        obj = validated.model_dump()
+
+        sp = colocated_summary_path(repo_root, rel_path)
+
+        # orion: Avoid persisting under ignored summary paths (e.g., ignored directories); honor .orionignore for targets too.
+        if is_ignored_path(repo_root, sp):
+            ctx.log(f"Skipping summary write for ignored target path: {sp.relative_to(repo_root).as_posix()}")
+            return obj
+
+        # orion: Route writes through fs.write_file to enforce .orionignore and create parents; compact separators minimize on-disk size.
+        rel_summary_path = sp.relative_to(repo_root).as_posix()
+        write_file(
+            repo_root,
+            rel_summary_path,
+            json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n",
+        )
+
+        return obj
 
     # orion: Route by language to minimal summary schemas (CodeSummary/HtmlSummary/InfoSummary/CssSummary) and prompts; emit minimal objects only (no headers/meta).
     if language_tag == "html":

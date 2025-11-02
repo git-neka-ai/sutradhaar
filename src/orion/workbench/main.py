@@ -255,6 +255,10 @@ class Orion:
         ctx.send_to_user(":preview              - Show pending changes")
         ctx.send_to_user(":apply                - Apply all pending changes")
         ctx.send_to_user(":discard-change <id>  - Discard a pending change by id")
+        # orion: Update help text to include :history and both clear commands (:clear-changes and alias :clearChanges) for discoverability.
+        ctx.send_to_user(":history              - Show last 10 user↔assistant turns from history")
+        ctx.send_to_user(":clear-changes        - Clear all pending changes")
+        ctx.send_to_user(":clearChanges         - Alias for :clear-changes")
         ctx.send_to_user(":refresh              - Rescan repo and refresh summaries")
         ctx.send_to_user(":refresh-deps         - Refresh Project Orion Summaries for external dependencies")
         ctx.send_to_user(":status               - Show status summary")
@@ -399,12 +403,47 @@ class Orion:
         self.storage.save_metadata(self.md)
         ctx.log(f"Consolidated. Pending changes now: {len(self.md['pending_changes'])}")
 
-    def auto_consolidate_if_needed(self, ctx: Context) -> None:
-        """Perform consolidation automatically every few batches to limit duplication."""
-        n = self.md["batches_since_last_consolidation"]
-        if n >= 3 and n % 3 == 0:
-            ctx.log("Auto-consolidating changes...")
-            self.cmd_consolidate(ctx)
+    # orion: Add helper used by both :clear-changes and :clearChanges to clear pending changes and persist.
+    def cmd_clear_changes(self, ctx: Context) -> None:
+        """Clear all pending changes and persist metadata."""
+        self.md["pending_changes"] = []
+        self.storage.save_metadata(self.md)
+        ctx.send_to_user("Cleared all pending changes.")
+
+    # orion: Add :history command to print the last 10 user↔assistant turns, excluding system/tool messages.
+    def cmd_history(self, ctx: Context, max_turns: int = 10) -> None:
+        """Print the last N user↔assistant turns from stored history."""
+        # Filter to only simple chat messages between user and assistant
+        msgs = [m for m in self.history if m.get("type") == "message" and m.get("role") in ("user", "assistant")]
+        turns: List[tuple[Optional[str], Optional[str]]] = []
+        pending_user: Optional[str] = None
+        for m in msgs:
+            role = m.get("role")
+            content = str(m.get("content", ""))
+            if role == "user":
+                if pending_user is not None:
+                    # orion: Close a user-only turn when no assistant reply arrived before the next user message.
+                    turns.append((pending_user, None))
+                pending_user = content
+            else:  # assistant
+                if pending_user is None:
+                    # orion: Record assistant-only outputs that may precede any user turn (e.g., system boot echoes excluded above).
+                    turns.append((None, content))
+                else:
+                    turns.append((pending_user, content))
+                    pending_user = None
+        if pending_user is not None:
+            turns.append((pending_user, None))
+        if not turns:
+            ctx.send_to_user("No user or assistant messages in history.")
+            return
+        last = turns[-max_turns:]
+        ctx.send_to_user(f"Last {len(last)} turn(s):")
+        for u, a in last:
+            if u is not None:
+                ctx.send_to_user(f"User: {u}")
+            if a is not None:
+                ctx.send_to_user(f"Assistant: {a}")
 
     def cmd_apply(self, ctx: Context) -> None:
         """
@@ -617,10 +656,12 @@ class Orion:
                     ctx.error_message("Usage: :discard-change <id>")
                 else:
                     self.cmd_discard_change(ctx, parts[1])
-            elif cmd == ":clear-changes":
-                self.md["pending_changes"] = []
-                self.storage.save_metadata(self.md)
-                ctx.send_to_user("Cleared all pending changes.")
+            # orion: Route :history to new cmd_history for compact display of last user↔assistant turns.
+            elif cmd == ":history":
+                self.cmd_history(ctx)
+            # orion: Use a shared helper for both kebab-case and camelCase clear commands.
+            elif cmd == ":clear-changes" or cmd == ":clearChanges":
+                self.cmd_clear_changes(ctx)
             elif cmd == ":refresh":
                 self.cmd_refresh(ctx)
             elif cmd == ":refresh-deps":
