@@ -13,14 +13,16 @@ from .context import Context
 from .fs import _safe_abs, count_lines, sha256_bytes, colocated_summary_path, is_ignored_path, write_file
 from .client import ChatCompletionsClient
 from .prompts import get_prompt
-from .models import CustomBaseModel, FileSummary
+# orion: Import new minimal summary models and remove legacy FileSummary usage.
+from .models import CustomBaseModel, CodeSummary, InfoSummary, HtmlSummary, CssSummary
 
 
 # orion: Add a small heuristic docstring for language detection.
 
 def guess_language(path: str) -> str:
-    """Guess a short language tag from a filename suffix (defaults to 'txt')."""
+    """Guess a short language tag from a filename suffix (defaults to 'info')."""
     ext = pathlib.Path(path).suffix.lower()
+    # orion: Extend heuristic to cover html/info/css and common config/text types for hybrid routing.
     return {
         ".py": "py",
         ".ts": "ts",
@@ -30,7 +32,19 @@ def guess_language(path: str) -> str:
         ".sh": "sh",
         ".bash": "sh",
         ".zsh": "sh",
-    }.get(ext, "txt")
+        ".html": "html",
+        ".htm": "html",
+        ".md": "info",
+        ".markdown": "info",
+        ".rst": "info",
+        ".txt": "info",
+        ".json": "info",
+        ".yaml": "info",
+        ".yml": "info",
+        ".toml": "info",
+        ".ini": "info",
+        ".css": "css",
+    }.get(ext, "info")
 
 
 # orion: Document summarization flow, including size cap, schema validation, and colocated output.
@@ -41,7 +55,7 @@ def summarize_file(ctx: Context, client: ChatCompletionsClient, repo_root: pathl
 
     Steps:
       1) Enforce a maximum file size to bound tokens and latency.
-      2) Build a strict schema (FileSummary) and call the model with a system prompt.
+      2) Route by language to minimal summary schemas and prompts.
       3) Validate the response and write to a/b/.orion/file.ext.json using compact separators.
 
     Returns:
@@ -71,25 +85,42 @@ def summarize_file(ctx: Context, client: ChatCompletionsClient, repo_root: pathl
 
     digest = sha256_bytes(data)
     text = data.decode("utf-8", errors="replace")
+    language_tag = guess_language(rel_path)
     info = {
         "path": rel_path,
-        "language": guess_language(rel_path),
+        "language": language_tag,
         "line_count": count_lines(text),
         "size_bytes": len(data),
         "sha256": digest,
     }
 
-    # orion: Load file summarizer system prompt from resources with dynamic line cap.
-    system_txt = get_prompt("prompt_summarizer_file_system.txt", line_cap=LINE_CAP)
+    # orion: Route by language to minimal summary schemas (CodeSummary/HtmlSummary/InfoSummary/CssSummary) and prompts; emit minimal objects only (no headers/meta).
+    if language_tag == "html":
+        system_txt = get_prompt("prompt_summarizer_html_system.txt")
+        schema = HtmlSummary.model_json_schema()
+        model_cls = HtmlSummary
+    elif language_tag == "css":
+        system_txt = get_prompt("prompt_summarizer_css_system.txt")
+        schema = CssSummary.model_json_schema()
+        model_cls = CssSummary
+    elif language_tag == "info":
+        system_txt = get_prompt("prompt_summarizer_info_system.txt")
+        schema = InfoSummary.model_json_schema()
+        model_cls = InfoSummary
+    else:
+        # Default: treat as code
+        system_txt = get_prompt("prompt_summarizer_code_system.txt", line_cap=LINE_CAP)
+        schema = CodeSummary.model_json_schema()
+        model_cls = CodeSummary
+
     user_txt = json.dumps({"info": info, "content": text}, ensure_ascii=False)
-    schema = FileSummary.model_json_schema()
 
     messages = [
         {"role": "system", "content": system_txt},
         {"role": "user", "content": user_txt}
     ]
 
-    ctx.log(f"Summarizing file: {rel_path} (size: {len(data)} bytes, lines: {info['line_count']})")
+    ctx.log(f"Summarizing file: {rel_path} (size: {len(data)} bytes, lines: {info['line_count']}, lang: {language_tag})")
     final_json = client.call_responses(
         ctx,
         messages=messages,
@@ -101,14 +132,12 @@ def summarize_file(ctx: Context, client: ChatCompletionsClient, repo_root: pathl
     )
 
     try:
-        fs = FileSummary.model_validate(final_json)
+        validated = model_cls.model_validate(final_json)
     except ValidationError as ve:
         ctx.error_message(f"Summary validation failed for {rel_path}: {ve}")
         return None
 
-    obj = fs.model_dump()
-    obj["p"] = rel_path
-    obj["b"] = digest
+    obj = validated.model_dump()
 
     sp = colocated_summary_path(repo_root, rel_path)
 

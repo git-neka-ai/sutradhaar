@@ -1,4 +1,4 @@
-# orion: Cleaned up the client to be Responses-only; removed Chat Completions helpers and updated docs to reduce maintenance and confusion.
+# orion: Replace clean_invalid_ref_nodes with _preprocess_for_openai; enforce required=all property keys and additionalProperties=false for objects; keep Responses-only client and improve strict schema compatibility.
 
 import json
 from typing import Any, Dict, List, Optional
@@ -11,23 +11,48 @@ from .context import Context
 from copy import deepcopy
 from pydantic import BaseModel
 
-def clean_invalid_ref_nodes(schema: dict) -> dict:
-    """Recursively remove sibling keys alongside `$ref` for OpenAI compatibility."""
-    def _clean(node):
-        if isinstance(node, dict):
-            if "$ref" in node:
-                # Only keep the `$ref`
-                for key in list(node.keys()):
-                    if key != "$ref":
-                        node.pop(key, None)
-            else:
-                for value in node.values():
-                    _clean(value)
-        elif isinstance(node, list):
-            for value in node:
-                _clean(value)
+# orion: Introduce a centralized OpenAI schema preprocessor that (1) removes sibling keys alongside $ref and (2) enforces strict object-shape requirements by ensuring required includes all property keys and additionalProperties=False for any node with properties.
+def _preprocess_for_openai(schema: dict) -> dict:
+    """
+    Prepare a JSON Schema for OpenAI strict validation:
+    - If a node has "$ref", remove all sibling keys and keep only the $ref.
+    - For any object node that defines "properties", ensure:
+        * "required" exists and includes every property key (deterministic order)
+        * "additionalProperties" is set to False
+    The transformation is applied recursively across the schema tree.
+    """
     cleaned = deepcopy(schema)
-    _clean(cleaned)
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            # If a $ref is present, drop all sibling keys for OpenAI compatibility
+            if "$ref" in node:
+                for k in list(node.keys()):
+                    if k != "$ref":
+                        node.pop(k, None)
+                return  # Nothing else to do at this node
+
+            # Enforce strict object shape where properties are specified
+            props = node.get("properties")
+            if isinstance(props, dict):
+                # Build required = all property keys (union with existing, deduped, sorted for determinism)
+                existing_req = node.get("required") or []
+                try:
+                    existing_set = set(existing_req)
+                except TypeError:
+                    existing_set = set()
+                all_keys = set(props.keys()) | existing_set
+                node["required"] = sorted(all_keys)
+                node["additionalProperties"] = False
+
+            # Recurse into all values
+            for v in list(node.values()):
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(cleaned)
     return cleaned
 
 
@@ -98,7 +123,8 @@ class ChatCompletionsClient:
                 exceeding the max tool-call loop turns.
         """
         reasoning_effort = "minimal" if call_type.endswith("_summary") else "medium"
-        response_schema = clean_invalid_ref_nodes(response_schema)
+        # orion: Preprocess schema for OpenAI strict mode: clean $ref siblings and enforce required for all properties with additionalProperties=False.
+        response_schema = _preprocess_for_openai(response_schema)
 
         # Build a stable, normalized sink so we don't branch on None repeatedly.
         def _sink(msg: Dict[str, Any]) -> None:

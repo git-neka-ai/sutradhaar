@@ -5,7 +5,8 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import List, Literal
+# orion: Add Optional typing import to support optional CodeSummary field in HtmlSummary.
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -34,6 +35,29 @@ class FileSummary(CustomBaseModel):
     r: List[str] = Field(..., description="List of risks/constraints")
     sm: List[str] = Field(..., description="List of notes on safe-to-modify areas")
 
+
+# orion: Add new minimal, language-aware summary models (no headers/meta) for hybrid routing.
+class CodeSummary(CustomBaseModel):
+    ex: List[str] = Field(default_factory=list, description="Exports/symbols")
+    im: List[str] = Field(default_factory=list, description="Imports/dependencies")
+    fx: List[str] = Field(default_factory=list, description="Functions")
+    cl: List[str] = Field(default_factory=list, description="Classes")
+    cfg: List[str] = Field(default_factory=list, description="Configs/environment variables used")
+    r: List[str] = Field(default_factory=list, description="Risks/constraints")
+    sm: List[str] = Field(default_factory=list, description="Notes on safe-to-modify areas")
+
+
+class InfoSummary(CustomBaseModel):
+    s: str = Field(..., description="Short synopsis (2–4 sentences)")
+
+
+class HtmlSummary(CustomBaseModel):
+    info: InfoSummary = Field(..., description="Synopsis of the HTML page")
+    code: Optional[CodeSummary] = Field(default=None, description="Summary of inline <script> JavaScript only")
+
+
+class CssSummary(CustomBaseModel):
+    sel: List[str] = Field(default_factory=list, description="Deduplicated CSS selectors")
 
 
 class ChangeType(str, Enum):
