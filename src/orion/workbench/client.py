@@ -10,6 +10,9 @@ from .context import Context
 
 from copy import deepcopy
 from pydantic import BaseModel
+# orion: Add pathlib and time for optional .httpcalls request/response logging to REST Client .http files.
+import pathlib
+import time
 
 # orion: Introduce a centralized OpenAI schema preprocessor that (1) removes sibling keys alongside $ref and (2) enforces strict object-shape requirements by ensuring required includes all property keys and additionalProperties=False for any node with properties.
 def _preprocess_for_openai(schema: dict) -> dict:
@@ -268,8 +271,50 @@ class ChatCompletionsClient:
                 pass
 
         while True:
+            # orion: Build payload once per POST so logging captures the exact body sent.
+            payload = _make_payload()
+
+            # orion: If repo_root/.httpcalls exists, write the request in REST Client format with redacted Authorization.
+            try:
+                httpcalls_dir = (pathlib.Path(ctx.repo_root) / ".httpcalls").resolve()
+                if httpcalls_dir.exists() and httpcalls_dir.is_dir():
+                    ts_ms = int(time.time() * 1000)
+                    http_file = httpcalls_dir / f"call-{ts_ms}.http"
+                    # Prepare headers with Authorization redacted for safe-at-rest logging.
+                    headers_for_log = dict(self.session.headers)
+                    headers_for_log["Authorization"] = "Bearer {{OPENAI_API_KEY}}"
+                    dumpHttpFile(str(http_file), url, "POST", headers_for_log, payload)
+                else:
+                    http_file = None
+            except Exception:
+                http_file = None  # Non-fatal: proceed without logging
+
             # orion: Conservative timeout to accommodate tool loops; Responses may stream chunks server-side.
-            r = self.session.post(url, json=_make_payload(), timeout=_timeout)
+            t0 = time.time()
+            r = self.session.post(url, json=payload, timeout=_timeout)
+            elapsed_ms = int((time.time() - t0) * 1000)
+
+            # orion: Append a response section to the same .http file with status, headers, body, and elapsed time (non-fatal on errors).
+            try:
+                if http_file is not None:
+                    with open(http_file, "a", encoding="utf-8") as f:
+                        f.write("\n\n### Response — elapsed_ms: " + str(elapsed_ms) + "\n")
+                        # Best-effort HTTP status line; requests doesn't expose HTTP version reliably.
+                        f.write(f"HTTP/1.1 {r.status_code} {getattr(r, 'reason', '')}\n")
+                        for hk, hv in r.headers.items():
+                            try:
+                                f.write(f"{hk}: {hv}\n")
+                            except Exception:
+                                continue
+                        f.write("\n")
+                        try:
+                            f.write(r.text)
+                        except Exception:
+                            # Fallback if body can't be decoded as text
+                            f.write("<binary/undecodable body>\n")
+            except Exception:
+                pass  # Non-fatal
+
             if r.status_code != 200:
                 # orion: Surface first 2KB of body for fast diagnostics without overwhelming logs.
                 raise RuntimeError(f"Responses API error {r.status_code}: {r.text[:2000]}")

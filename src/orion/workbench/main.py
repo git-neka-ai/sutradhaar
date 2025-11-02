@@ -793,6 +793,20 @@ class Orion:
         else:
             print("External dependency PD root not set (use --external-dir to enable).")
         print("Type :help for commands.")
+        # orion: Recommend ignoring .httpcalls logs; this is a one-line, non-fatal tip shown at startup if .gitignore lacks an entry for .httpcalls.
+        try:
+            gi = (self.repo_root / ".gitignore")
+            needs_tip = True
+            if gi.exists():
+                try:
+                    if ".httpcalls" in gi.read_text(encoding="utf-8"):
+                        needs_tip = False
+                except Exception:
+                    pass
+            if needs_tip:
+                print("Tip: add .httpcalls to .gitignore to avoid committing request logs.")
+        except Exception:
+            pass
         ctx = Context(self.repo_root)
         while True:
             try:
