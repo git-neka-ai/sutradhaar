@@ -265,6 +265,8 @@ class Orion:
         ctx.send_to_user(":consolidate          - Manually consolidate pending changes")
         ctx.send_to_user(":help                 - Show this help")
         ctx.send_to_user(":quit                 - Exit")
+        # orion: Document per-turn model override directive; parsed before command routing and applied only to the next conversation call.
+        ctx.send_to_user(":model <model> <message> - Use model for only this turn")
 
     def cmd_preview(self, ctx: Context) -> None:
         """Display all pending change specs in a human-readable format."""
@@ -641,8 +643,23 @@ class Orion:
         """
         Handle a line of user input: either execute a command or advance the conversation.
         """
+        # orion: Support per-turn model override via ':model <model> <message>'. Parse this before command routing;
+        # on success, strip the directive, log usage, and proceed down the conversation path with an override.
+        override_model: Optional[str] = None
+        was_model_override = False
+        if text.startswith(":model"):
+            parts_model = text.strip().split(maxsplit=2)
+            if len(parts_model) >= 3 and parts_model[1] and parts_model[2].strip():
+                override_model = parts_model[1]
+                text = parts_model[2].strip()
+                was_model_override = True
+                ctx.log(f"Using per-turn model override: {override_model}")
+            else:
+                ctx.error_message("Usage: :model <model> <message>")
+                return
+
         # Commands
-        if text.startswith(":"):
+        if (not was_model_override) and text.startswith(":"):
             parts = text.strip().split()
             cmd = parts[0]
             if cmd == ":help":
@@ -682,7 +699,7 @@ class Orion:
         # orion: New conversation bootstrap via system_state. Ensure authoritative state exists at session start.
         self._ensure_system_state(ctx)
 
-        # Append user turn (raw)
+        # Append user turn (raw). When a per-turn model override is used, only <message> (without the directive) is appended.
         self.storage.append_raw_message({"type": "message", "role": "user", "content": text})
         self.history.append({"type": "message", "role": "user", "content": text})
 
@@ -737,7 +754,7 @@ class Orion:
             self.history.append(msg)
 
         ctx.log("Calling model for conversation response...")
-        # orion: Migrate conversation flow to Responses API; include message sink and set call_type="conversation".
+        # orion: Pass the optional per-turn model override to Responses API; when None, the client's default model is used.
         final_json = self.client.call_responses(
             ctx,
             messages,
@@ -746,6 +763,7 @@ class Orion:
             interactive_tool_runner=runner,
             message_sink=sink,
             call_type="conversation",
+            model=override_model,
         )
 
         # orion: Parse with Pydantic models, then convert to plain dicts for storage.
