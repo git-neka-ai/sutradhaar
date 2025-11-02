@@ -141,6 +141,33 @@ class ChatCompletionsClient:
         max_tool_turns = 50
         turns = 0
 
+        # orion: Helpers to locate/emit the latest system_state inside the in-flight message list.
+        def _parse_system_state_from_msg(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            if not isinstance(msg, dict) or msg.get("role") != "system":
+                return None
+            content = msg.get("content")
+            if not isinstance(content, str):
+                return None
+            try:
+                obj = json.loads(content)
+            except Exception:
+                return None
+            if isinstance(obj, dict) and obj.get("type") == "system_state":
+                return obj
+            return None
+
+        def _find_latest_system_state() -> Optional[Dict[str, Any]]:
+            for m in reversed(local_messages):
+                obj = _parse_system_state_from_msg(m)
+                if obj is not None:
+                    return obj
+            return None
+
+        def _append_system_state(obj: Dict[str, Any]) -> None:
+            msg = {"type": "message", "role": "system", "content": json.dumps(obj, ensure_ascii=False)}
+            _sink(msg)
+            local_messages.append(msg)
+
         def _make_payload() -> Dict[str, Any]:
             # orion: Keep the same json_schema format you already use; Responses nests it under text.format.
             payload = {
@@ -279,11 +306,54 @@ class ChatCompletionsClient:
                     # Run the tool
                     ctx.log(f"Invoking tool: {name} with args: {json.dumps(args)}")
                     tool_output = interactive_tool_runner(name, args)
+
+                    # orion: Always emit the function_call record.
                     _itc = { "type": "function_call", "name": name, "arguments": args_text, "call_id": tc_id }
-                    _otc = { "type": "function_call_output", "call_id": tc_id, "output": json.dumps(tool_output, ensure_ascii=False) }
                     _sink(_itc)
-                    _sink(_otc)
                     local_messages.append(_itc)
+
+                    # orion: Intercept get_file_contents to mutate system_state instead of streaming large content.
+                    output_to_emit: Any = tool_output
+                    if name == "get_file_contents" and isinstance(tool_output, dict):
+                        # Extract raw result regardless of envelope shape
+                        result = tool_output.get("result") if "result" in tool_output else tool_output
+                        path = None
+                        content = None
+                        line_count = None
+                        if isinstance(result, dict):
+                            path = result.get("path")
+                            content = result.get("content")
+                            line_count = result.get("line_count")
+                        state_obj = _find_latest_system_state()
+                        if path and isinstance(content, str) and isinstance(state_obj, dict):
+                            files_map = state_obj.get("files") or {}
+                            entry = files_map.get(path)
+                            if isinstance(entry, dict) and entry.get("kind") == "full":
+                                output_to_emit = {"status": "noop", "reason": "already_full", "path": path}
+                            else:
+                                # Promote to full in system_state
+                                try:
+                                    bcount = len(content.encode("utf-8"))
+                                except Exception:
+                                    bcount = 0
+                                files_map[path] = {
+                                    "kind": "full",
+                                    "body": content,
+                                    "meta": {"line_count": int(line_count) if line_count is not None else None, "bytes": bcount},
+                                }
+                                state_obj["files"] = files_map
+                                try:
+                                    state_obj["version"] = int(state_obj.get("version", 0) or 0) + 1
+                                except Exception:
+                                    state_obj["version"] = 1
+                                _append_system_state(state_obj)
+                                output_to_emit = {"status": "ok", "path": path, "note": "contents added to system_state"}
+                        elif name == "get_file_contents":
+                            # No system_state or malformed tool result: avoid streaming file content
+                            output_to_emit = {"status": "noop", "reason": "no_system_state_or_malformed_result"}
+
+                    _otc = { "type": "function_call_output", "call_id": tc_id, "output": json.dumps(output_to_emit, ensure_ascii=False) }
+                    _sink(_otc)
                     local_messages.append(_otc)
 
                 # orion: Loop back to let the model continue after tool outputs are present in context.

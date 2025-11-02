@@ -1,4 +1,4 @@
-# orion: Introduce reflective tool discovery for internal tools and a generic runner that injects/strips reason_for_call. Replace manual tool registry and reason-aware tools with reflection-based specs and typed external wrappers.
+# orion: Replace bootstrap flow with a persistent, authoritative system_state message and ensure it is included at the front of every model call. Add builders/helpers to create, ensure, and select the latest system_state, and update handle_user_input/apply to use it.
 
 import pathlib
 import sys
@@ -189,17 +189,12 @@ class Orion:
         except Exception as e:
             return {"_meta_error": f"get_pos failed for {filename}: {e}"}
 
-    # ---------- Bootstrap helpers ----------
+    # ---------- System State helpers ----------
 
-    def _build_bootstrap_message(self, ctx: Context, pending_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Build a one-time bootstrap system message with the full file list and summaries.
-
-        Includes colocated per-file summaries (if present) and lightweight heads
-        for external dependency projects if configured.
-        """
+    # orion: Build the authoritative system_state from current repo paths and colocated summaries.
+    def _build_system_state_message(self, ctx: Context) -> Dict[str, Any]:
         files = list_all_nonignored_files(self.repo_root)
-        items = []
+        files_map: Dict[str, Any] = {}
         for p in files:
             summ = None
             sp = colocated_summary_path(self.repo_root, p)
@@ -209,41 +204,48 @@ class Orion:
                         summ = json.load(f)
                 except Exception:
                     summ = None
-            items.append({"path": p, "summary": summ})
-
+            files_map[p] = {"kind": "summary", "body": summ, "meta": {"has_summary": bool(summ)}}
         payload: Dict[str, Any] = {
-            "type": "orion_bootstrap",
-            "note": "This is the complete list of files in the repository at this time; treat it as authoritative.And these are the complete list of pending changes.",
-            "complete_list": True,
-            "files": items,
-            "pending_changes": pending_changes,
+            "type": "system_state",
+            "version": 1,
+            "files": files_map,
         }
+        return {"type": "message", "role": "system", "content": json.dumps(payload, ensure_ascii=False)}
 
-        # External dependency heads (filenames + small counts)
-        if self.ext_root:
-            try:
-                heads = ensure_all_pos(ctx, self.ext_root, self.client)
-            except Exception:
-                heads = []
-            payload["dependency_projects"] = heads
-
-        return {"type":"message","role": "system", "content": json.dumps(payload, ensure_ascii=False)}
-
-    def _ensure_bootstrap(self, ctx: Context, pending_changes: List[Dict[str, Any]]) -> None:
-        """
-        If a conversation has not yet started, refresh local/external summaries and
-        persist an initial bootstrap system message for the model.
-        """
+    # orion: Ensure a system_state is present as the first stored message; refresh colocated summaries first.
+    def _ensure_system_state(self, ctx: Context) -> None:
         self._refresh_summaries(ctx)
-        # Ensure external POS (if configured)
-        if self.ext_root:
-            ensure_all_pos(ctx, self.ext_root, self.client)
-        bootstrap_msg = self._build_bootstrap_message(ctx, pending_changes)
-        if ( self.history == [] ) or ( self.history[0].get("type") != "orion_bootstrap" ):
-            self.storage.append_raw_message(bootstrap_msg)
-            self.history.insert(0, bootstrap_msg)
+        new_state_msg = self._build_system_state_message(ctx)
+        # If no history or first item isn't a system_state, insert one and persist.
+        first_is_state = False
+        if self.history:
+            try:
+                if self.history[0].get("role") == "system":
+                    c = self.history[0].get("content", "")
+                    obj = json.loads(c) if isinstance(c, str) else {}
+                    first_is_state = isinstance(obj, dict) and obj.get("type") == "system_state"
+            except Exception:
+                first_is_state = False
+        if (self.history == []) or (not first_is_state):
+            self.storage.append_raw_message(new_state_msg)
+            self.history.insert(0, new_state_msg)
         else:
-            self.history[0] = bootstrap_msg
+            # Keep first message as the refreshed authoritative state for the next call.
+            self.history[0] = new_state_msg
+
+    # orion: Locate the most recent system_state payload in history; returns a message dict or None.
+    def _latest_system_state_message(self) -> Optional[Dict[str, Any]]:
+        for msg in reversed(self.history):
+            if msg.get("role") != "system":
+                continue
+            try:
+                content = msg.get("content", "")
+                obj = json.loads(content) if isinstance(content, str) else None
+                if isinstance(obj, dict) and obj.get("type") == "system_state":
+                    return {"type": "message", "role": "system", "content": json.dumps(obj, ensure_ascii=False)}
+            except Exception:
+                continue
+        return None
 
     # ---------- Commands ----------
 
@@ -416,6 +418,10 @@ class Orion:
         if not pending:
             ctx.send_to_user("No pending changes to apply.")
             return
+
+        # orion: Ensure system_state exists and is fresh before model calls.
+        self._ensure_system_state(ctx)
+
         # Collect affected paths and current contents
         affected = set()
         for ch in pending:
@@ -460,7 +466,18 @@ class Orion:
                 return {"reason_for_call": reason, "result": payload}
             return {"reason_for_call": reason, "result": {"_meta_error": f"unknown tool {name}", "_args_echo": args}}
 
-        messages = [{"role": "system", "content": system_text}, {"role": "user", "content": user_text}]
+        # orion: Build messages: latest system_state at the front, then the apply system prompt, then the user payload.
+        latest_state = self._latest_system_state_message()
+        if not latest_state:
+            # Fallback: ensure and rebuild one
+            self._ensure_system_state(ctx)
+            latest_state = self._latest_system_state_message()
+        messages: List[Dict[str, Any]] = []
+        if latest_state:
+            messages.append(latest_state)
+        messages.append({"type": "message", "role": "system", "content": system_text})
+        messages.append({"type": "message", "role": "user", "content": user_text})
+
         ctx.log("Calling model to apply changes...")
         # orion: Migrate :apply flow to Responses API using Pydantic schema; tool runner preserved.
         final_json = self.client.call_responses(
@@ -577,8 +594,8 @@ class Orion:
                 ctx.error_message(f"Unknown command: {cmd}. Type :help for help.")
             return
 
-        # New conversation bootstrap if needed (no history file present)
-        self._ensure_bootstrap(ctx,self.md["pending_changes"])
+        # orion: New conversation bootstrap via system_state. Ensure authoritative state exists at session start.
+        self._ensure_system_state(ctx)
 
         # Append user turn (raw)
         self.storage.append_raw_message({"type": "message", "role": "user", "content": text})
@@ -590,9 +607,21 @@ class Orion:
         # orion: Replace inline JSON Schema with centralized Pydantic model schema.
         response_schema = ConversationResponse.model_json_schema()
 
-        # Rebuild messages: prepend conversation system prompt, then replay full stored history verbatim
-        messages = [{"type": "message", "role": "system", "content": system_text}]
+        # Rebuild messages: prepend latest system_state, then conversation system prompt, then replay history excluding previous system_state echoes
+        messages: List[Dict[str, Any]] = []
+        latest_state = self._latest_system_state_message()
+        if latest_state:
+            messages.append(latest_state)
+        messages.append({"type": "message", "role": "system", "content": system_text})
         for h in self.history:
+            # Filter out prior system_state messages to avoid duplication; the latest is already prepended.
+            if h.get("role") == "system":
+                try:
+                    obj = json.loads(h.get("content", ""))
+                    if isinstance(obj, dict) and obj.get("type") == "system_state":
+                        continue
+                except Exception:
+                    pass
             msg = h.copy()
             if "ts" in msg:
                 del msg["ts"]

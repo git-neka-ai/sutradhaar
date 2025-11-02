@@ -1,4 +1,4 @@
-# orion: Add @tool decorator, reflection-based schema builder, an internal registry, discover_tools(), list_tool_names(), and run_tool(). Tools are refactored to (ctx, typed primitives...) and return raw payloads. Dispatch injects/strips reason_for_call so tools remain unaware.
+# orion: Slim tool surface to core set and reflective registry. Remove get_file_snippet and get_summary; promote get_file_contents to be used with system_state promotions.
 
 import inspect
 import json
@@ -6,7 +6,7 @@ import pathlib
 from typing import Any, Dict, List, Optional, Callable, get_type_hints
 
 from .context import Context
-from .fs import list_repo_paths, normalize_path, read_file, colocated_summary_path, count_lines
+from .fs import list_repo_paths, normalize_path, read_file, count_lines
 
 # -----------------------------
 # Reflection utilities and registry
@@ -160,37 +160,6 @@ def get_file_contents(ctx: Context, path: str) -> Dict[str, Any]:
     except Exception:
         return {"_meta_error": f"Could not read {np}"}
     return {"path": np, "content": content, "line_count": count_lines(content)}
-
-
-# orion: get_file_snippet returns an inclusive [start_line, end_line] snippet with bounds adjusted.
-@tool(name="get_file_snippet", description="Return an inclusive [start_line, end_line] snippet from a file.")
-def get_file_snippet(ctx: Context, path: str, start_line: int = 1, end_line: Optional[int] = None) -> Dict[str, Any]:
-    np = normalize_path(path)
-    try:
-        content = read_file(ctx.repo_root, np)
-    except Exception:
-        return {"_meta_error": f"Could not read {np}"}
-    lines = content.splitlines()
-    start = max(1, int(start_line))
-    end = int(end_line) if end_line is not None else start + 200
-    end = min(len(lines), end if end >= start else start)
-    snippet = "\n".join(lines[start - 1 : end])
-    return {"path": np, "start_line": start, "end_line": end, "content": snippet}
-
-
-# orion: get_summary reads colocated .orion summary JSON for a file if present.
-@tool(name="get_summary", description="Return a brief machine-oriented summary for a local repo file, if available.")
-def get_summary(ctx: Context, path: str) -> Dict[str, Any]:
-    np = normalize_path(path)
-    try:
-        sp = colocated_summary_path(ctx.repo_root, np)
-        if sp.exists():
-            with sp.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            return {"path": np, "summary": data, "_meta_note": "summary returned (colocated)"}
-        return {"_meta_error": f"no summary available for {np}"}
-    except Exception as e:
-        return {"_meta_error": f"summary error for {np}: {e}"}
 
 
 # orion: search_code performs a linear substring scan (case-insensitive) across non-ignored files.
