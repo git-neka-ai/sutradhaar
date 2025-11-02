@@ -422,12 +422,17 @@ class Orion:
         # orion: Ensure system_state exists and is fresh before model calls.
         self._ensure_system_state(ctx)
 
-        # Collect affected paths and current contents
-        affected = set()
+        # Collect affected paths
+        affected: set[str] = set()
         for ch in pending:
             for it in ch.get("items", []):
                 affected.add(it["path"])
-        files_payload = []
+
+        # orion: Promote affected files to 'full' in system_state so it becomes the single source of truth for contents.
+        # This avoids duplicating raw file text in the user payload and aligns with how get_file_contents promotions work.
+        # Steps: read current contents + meta, update the latest system_state.files[path] = {kind:"full", body, meta}, bump version,
+        # and use the upgraded system_state as the first message of the apply call.
+        content_map: Dict[str, Dict[str, Any]] = {}
         for p in sorted(affected):
             content = ""
             abs_path = self.repo_root / p
@@ -436,7 +441,45 @@ class Orion:
                     content = read_file(self.repo_root, p)
                 except Exception:
                     content = ""
-            files_payload.append({"path": p, "content": content})
+            try:
+                bcount = len(content.encode("utf-8"))
+            except Exception:
+                bcount = 0
+            lcount = count_lines(content)
+            content_map[p] = {"content": content, "meta": {"line_count": lcount, "bytes": bcount}}
+
+        latest_state = self._latest_system_state_message()
+        if not latest_state:
+            # Fallback: ensure and rebuild one if missing
+            self._ensure_system_state(ctx)
+            latest_state = self._latest_system_state_message()
+        if latest_state:
+            try:
+                state_obj = json.loads(latest_state["content"]) if isinstance(latest_state.get("content"), str) else None
+            except Exception:
+                state_obj = None
+            if isinstance(state_obj, dict) and state_obj.get("type") == "system_state":
+                files_map = state_obj.get("files") or {}
+                for path_key, info in content_map.items():
+                    entry = files_map.get(path_key)
+                    if isinstance(entry, dict) and entry.get("kind") == "full":
+                        # Already full; skip overwrite to avoid redundant churn
+                        continue
+                    files_map[path_key] = {
+                        "kind": "full",
+                        "body": info["content"],
+                        "meta": {"line_count": info["meta"]["line_count"], "bytes": info["meta"]["bytes"]},
+                    }
+                state_obj["files"] = files_map
+                try:
+                    state_obj["version"] = int(state_obj.get("version", 0) or 0) + 1
+                except Exception:
+                    state_obj["version"] = 1
+                latest_state = {"type": "message", "role": "system", "content": json.dumps(state_obj, ensure_ascii=False)}
+
+        # orion: Build Apply prompt and a compact user payload that references no raw file contents.
+        # We intentionally send an empty files array because the upgraded system_state now carries full contents.
+        files_payload: List[Dict[str, Any]] = []
 
         # orion: Load Apply system prompt from resources so it can be maintained externally.
         system_text = get_prompt("prompt_apply_system.txt")
@@ -466,15 +509,16 @@ class Orion:
                 return {"reason_for_call": reason, "result": payload}
             return {"reason_for_call": reason, "result": {"_meta_error": f"unknown tool {name}", "_args_echo": args}}
 
-        # orion: Build messages: latest system_state at the front, then the apply system prompt, then the user payload.
-        latest_state = self._latest_system_state_message()
-        if not latest_state:
-            # Fallback: ensure and rebuild one
-            self._ensure_system_state(ctx)
-            latest_state = self._latest_system_state_message()
+        # orion: Build messages: upgraded latest system_state at the front, then the apply system prompt, then the user payload.
         messages: List[Dict[str, Any]] = []
         if latest_state:
             messages.append(latest_state)
+        else:
+            # In the unlikely event state is still missing, ensure one more time (non-fatal if still None)
+            self._ensure_system_state(ctx)
+            ls2 = self._latest_system_state_message()
+            if ls2:
+                messages.append(ls2)
         messages.append({"type": "message", "role": "system", "content": system_text})
         messages.append({"type": "message", "role": "user", "content": user_text})
 
