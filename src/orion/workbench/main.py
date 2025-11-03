@@ -783,7 +783,6 @@ class Orion:
             self.md["pending_changes"].extend(changes)
             self.md["batches_since_last_consolidation"] += 1
             self.storage.save_metadata(self.md)
-            self.auto_consolidate_if_needed(ctx)
 
     def run(self) -> None:
         """Start the interactive REPL loop for Orion."""
