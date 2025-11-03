@@ -267,6 +267,9 @@ class Orion:
         ctx.send_to_user(":quit                 - Exit")
         # orion: Document per-turn model override directive; parsed before command routing and applied only to the next conversation call.
         ctx.send_to_user(":model <model> <message> - Use model for only this turn")
+        # orion: Add new utility commands for token counting and ad-hoc file splitting.
+        ctx.send_to_user(":tokenCount <path>    - Count tokens for <path> using the configured model")
+        ctx.send_to_user(":splitFile <path>     - Split a file via model-assisted refactor and write results immediately")
 
     def cmd_preview(self, ctx: Context) -> None:
         """Display all pending change specs in a human-readable format."""
@@ -447,6 +450,115 @@ class Orion:
             if a is not None:
                 ctx.send_to_user(f"Assistant: {a}")
 
+    # orion: New command to count tokens in a given file using tiktoken and the configured model.
+    def cmd_token_count(self, ctx: Context, path: str) -> None:
+        np = normalize_path(path)
+        try:
+            content = read_file(self.repo_root, np)
+        except Exception as e:
+            ctx.error_message(f"Could not read {np}: {e}")
+            return
+        # Import tiktoken locally to avoid module import at startup.
+        try:
+            import tiktoken  # type: ignore
+        except Exception as e:
+            ctx.error_message(f"tiktoken is not available: {e}")
+            return
+        # orion: Prefer model-specific encoding; fall back to cl100k_base if unknown.
+        try:
+            enc = tiktoken.encoding_for_model(AI_MODEL)
+        except Exception:
+            try:
+                enc = tiktoken.get_encoding("cl100k_base")
+            except Exception as e:
+                ctx.error_message(f"Failed to load token encoding: {e}")
+                return
+        try:
+            tokens = enc.encode(content)
+        except Exception as e:
+            ctx.error_message(f"Failed to encode content for {np}: {e}")
+            return
+        ctx.send_to_user(f"Token count for {np} (model={AI_MODEL}): {len(tokens)}")
+
+    # orion: New command to split a file by invoking a dedicated split prompt and applying returned patches immediately.
+    def cmd_split_file(self, ctx: Context, path: str) -> None:
+        np = normalize_path(path)
+        try:
+            content = read_file(self.repo_root, np)
+        except Exception as e:
+            ctx.error_message(f"Could not read {np}: {e}")
+            return
+        # Build split prompt and schema
+        system_text = get_prompt("prompt_split_system.txt")
+        user_payload = {
+            "path": np,
+            "line_cap": LINE_CAP,
+            "content": content,
+        }
+        schema = ApplyResponse.model_json_schema()
+
+        # Build minimal tool surface (internal + external) for optional lookups.
+        tools: List[Dict[str, Any]] = []
+        tools.extend(self.internal_tool_specs)
+        tools.extend(_external_tool_definitions())
+
+        def runner(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+            reason = str(args.get("reason_for_call") or "")
+            if name in self.internal_tool_names:
+                return run_tool(ctx, name, args)
+            if name == "list_project_descriptions":
+                payload = self._tool_list_pds(ctx)
+                return {"reason_for_call": reason, "result": payload}
+            if name == "get_project_orion_summary":
+                filename = str(args.get("filename") or "")
+                payload = self._tool_get_pos(ctx, filename)
+                return {"reason_for_call": reason, "result": payload}
+            return {"reason_for_call": reason, "result": {"_meta_error": f"unknown tool {name}", "_args_echo": args}}
+
+        messages = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ]
+
+        ctx.log(f"Calling model to split file: {np}")
+        final_json = self.client.call_responses(
+            ctx,
+            messages=messages,
+            tools=tools,
+            response_schema=schema,
+            interactive_tool_runner=runner,
+            call_type="split",
+            _timeout=1800,
+        )
+
+        try:
+            parsed = ApplyResponse.model_validate(final_json)
+        except ValidationError as e:
+            ctx.error_message(f"Split failed: invalid response from model: {e}")
+            return
+
+        if parsed.mode == "incompatible":
+            ctx.send_to_user("Split operation reported incompatibility:")
+            for issue in parsed.issues:
+                ctx.send_to_user(f"- {issue.reason}: {', '.join(issue.paths)}")
+            ctx.send_to_user(f"Explanation: {parsed.explanation}")
+            return
+
+        # Write files and refresh summaries
+        written_paths: List[str] = []
+        for f in parsed.files:
+            write_file(self.repo_root, f.path, f.code)
+            written_paths.append(f.path)
+        if written_paths:
+            self._refresh_summaries(ctx, only_paths=written_paths)
+
+        # Record a commit-log style entry for traceability
+        self.md["plan_state"]["commit_log"].append(
+            {"id": short_id("split"), "ts": now_ts(), "paths": written_paths, "explanation": parsed.explanation}
+        )
+        self.storage.save_metadata(self.md)
+        ctx.send_to_user(f"Wrote {len(written_paths)} file(s). Explanation: {parsed.explanation}")
+
     def cmd_apply(self, ctx: Context) -> None:
         """
         Apply all pending changes by asking the model to produce a file map.
@@ -614,30 +726,7 @@ class Orion:
         self.storage.save_metadata(self.md)
         ctx.log("Cleared conversation history and pending change log.")
 
-        # Post-apply LINE_CAP follow-ups
-        added_splits = 0
-        for f in parsed.files:
-            lines = count_lines(f.code)
-            if lines > LINE_CAP:
-                path = f.path
-                stem = pathlib.Path(path).stem
-                ext = pathlib.Path(path).suffix
-                target2 = normalize_path(str(pathlib.Path(path).with_name(f"{stem}_part2{ext}")))
-                change_id = short_id("split")
-                split_change = make_change_spec(
-                    change_id,
-                    f"Split {path} to meet LINE_CAP",
-                    "Split required to reduce line count",
-                    [
-                        make_change_item(path, "modify", f"Reduce lines from {lines} to below {LINE_CAP}"),
-                        make_change_item(target2, "create", "Create second part of split"),
-                    ],
-                )
-                self.md["pending_changes"].append(split_change)
-                added_splits += 1
-        if added_splits:
-            self.storage.save_metadata(self.md)
-            ctx.log(f"Added {added_splits} split follow-up change(s) due to LINE_CAP.")
+        # orion: Removed post-apply LINE_CAP auto-splitting; users can now run :splitFile when desired.
 
     def handle_user_input(self, ctx: Context, text: str) -> None:
         """
@@ -687,6 +776,17 @@ class Orion:
                 self.cmd_status(ctx)
             elif cmd == ":consolidate":
                 self.cmd_consolidate(ctx)
+            # orion: New utility commands wired into the REPL.
+            elif cmd == ":tokenCount":
+                if len(parts) < 2:
+                    ctx.error_message("Usage: :tokenCount <path>")
+                else:
+                    self.cmd_token_count(ctx, parts[1])
+            elif cmd == ":splitFile":
+                if len(parts) < 2:
+                    ctx.error_message("Usage: :splitFile <path>")
+                else:
+                    self.cmd_split_file(ctx, parts[1])
             elif cmd == ":quit":
                 ctx.send_to_user("Goodbye.")
                 import sys
