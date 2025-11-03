@@ -267,8 +267,7 @@ class Orion:
         ctx.send_to_user(":quit                 - Exit")
         # orion: Document per-turn model override directive; parsed before command routing and applied only to the next conversation call.
         ctx.send_to_user(":model <model> <message> - Use model for only this turn")
-        # orion: Add new utility commands for token counting and ad-hoc file splitting.
-        ctx.send_to_user(":tokenCount <path>    - Count tokens for <path> using the configured model")
+        # orion: Remove token counting command; keep ad-hoc file splitting only.
         ctx.send_to_user(":splitFile <path>     - Split a file via model-assisted refactor and write results immediately")
 
     def cmd_preview(self, ctx: Context) -> None:
@@ -450,36 +449,7 @@ class Orion:
             if a is not None:
                 ctx.send_to_user(f"Assistant: {a}")
 
-    # orion: New command to count tokens in a given file using tiktoken and the configured model.
-    def cmd_token_count(self, ctx: Context, path: str) -> None:
-        np = normalize_path(path)
-        try:
-            content = read_file(self.repo_root, np)
-        except Exception as e:
-            ctx.error_message(f"Could not read {np}: {e}")
-            return
-        # Import tiktoken locally to avoid module import at startup.
-        try:
-            import tiktoken  # type: ignore
-        except Exception as e:
-            ctx.error_message(f"tiktoken is not available: {e}")
-            return
-        # orion: Prefer model-specific encoding; fall back to cl100k_base if unknown.
-        try:
-            enc = tiktoken.encoding_for_model(AI_MODEL)
-        except Exception:
-            try:
-                enc = tiktoken.get_encoding("cl100k_base")
-            except Exception as e:
-                ctx.error_message(f"Failed to load token encoding: {e}")
-                return
-        try:
-            tokens = enc.encode(content)
-        except Exception as e:
-            ctx.error_message(f"Failed to encode content for {np}: {e}")
-            return
-        ctx.send_to_user(f"Token count for {np} (model={AI_MODEL}): {len(tokens)}")
-
+    # orion: Remove the token counting command (:tokenCount) and its tiktoken dependency; only :splitFile remains.
     # orion: New command to split a file by invoking a dedicated split prompt and applying returned patches immediately.
     def cmd_split_file(self, ctx: Context, path: str) -> None:
         np = normalize_path(path)
@@ -776,12 +746,7 @@ class Orion:
                 self.cmd_status(ctx)
             elif cmd == ":consolidate":
                 self.cmd_consolidate(ctx)
-            # orion: New utility commands wired into the REPL.
-            elif cmd == ":tokenCount":
-                if len(parts) < 2:
-                    ctx.error_message("Usage: :tokenCount <path>")
-                else:
-                    self.cmd_token_count(ctx, parts[1])
+            # orion: Remove :tokenCount; keep :splitFile utility command wired into the REPL.
             elif cmd == ":splitFile":
                 if len(parts) < 2:
                     ctx.error_message("Usage: :splitFile <path>")

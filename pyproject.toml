@@ -8,12 +8,10 @@ version = "0.1.0"
 description = "Python code editor"
 readme = "README.md"
 requires-python = ">=3.11"
-# orion: Add tiktoken so :tokenCount can compute token counts for the configured model.
-# orion: Keep a conservative upper bound to avoid future-breaking major changes.
+# orion: Remove tiktoken dependency now that :tokenCount was removed to avoid installation/runtime issues and reduce optional deps.
 dependencies = [
   "requests>=2.31,<3",
-  "pydantic>=2,<3",
-  "tiktoken>=0.7,<0.8",
+  "pydantic>=2,<3"
 ]
 
 # CLI entry points (optional; add one per module bootstrap)
