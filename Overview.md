@@ -25,7 +25,7 @@ This document explains the system architecture, core components, interaction flo
 - Tooling Layer (functions namespace)
   - list_paths: Enumerate repo files (optionally by glob).
   - get_file_contents: Retrieve full file contents.
-  - search_code: Search for substrings across files.
+  - search_files: Search for substrings across files.
   - ask_user: Request clarifications from the user when needed.
   - External PD helpers (flat directory):
     - list_project_descriptions
@@ -46,7 +46,7 @@ flowchart LR
   subgraph Tools[functions.* tools]
     LP[list_paths]
     GFC[get_file_contents]
-    SC[search_code]
+    SC[search_files]
     AU[ask_user]
     LPD[list_project_descriptions]
     GPOS[get_project_orion_summary]
@@ -104,7 +104,7 @@ sequenceDiagram
 
   U->>O: Submit change specs + context
   O->>O: Ensure/refresh system_state (as first message)
-  O->>T: list_paths / get_file_contents / search_code / ask_user (if needed)
+  O->>T: list_paths / get_file_contents / search_files / ask_user (if needed)
   T->>R: Read repository files
   T-->>O: Data
   O-->>H: Strict JSON proposal (conversation response)
@@ -195,12 +195,13 @@ Example snippet:
 ```
 
 ### ApplyResponse (model-driven)
+files is a list of FileContents items.
 ```
 {
   "mode": "ok" | "incompatible",
   "explanation": "<string>",
   "files": [
-    { "path": "<string>", "is_new": true|false, "code": "<full file>" }
+    { "path": "<string>", "is_new": true|false, "contents": "<full file>" }
   ],
   "issues": [ { "reason": "<string>", "paths": ["<path>", ...] } ]
 }
@@ -209,7 +210,7 @@ Example snippet:
 ### Tool Call Parameters (current)
 - list_paths: { glob?: string }
 - get_file_contents: { path: string }
-- search_code: { query: string, max_results?: number }
+- search_files: { query: string, max_results?: number }
 - ask_user: { prompt: string }
 - list_project_descriptions: {}
 - get_project_orion_summary: { filename: string }
@@ -220,7 +221,7 @@ Example snippet:
 - Strict JSON Output
   - Always return a single JSON object with the prescribed fields.
 - Rationale Comments
-  - Insert `orion:` comments immediately before each change in code/doc files. If a prior `orion:` comment exists, update it.
+  - Insert `orion:` comments immediately before each change in code files where comments are syntactically supported. Do not insert them into prose (.md/.txt/.rst/.mdx/.html) or data formats (.json/.yaml/.toml/.csv). In those cases, provide reasoning only in ApplyResponse.explanation. If a prior `orion:` comment exists, update it.
 - Tool Usage Policy
   - Prefer tools when additional context is needed; batch calls and avoid redundant fetches.
 - Formatting Constraints
@@ -234,16 +235,18 @@ Example snippet:
 - Timeouts and Idempotency
   - Keep tool calls deterministic where possible; retry or report clearly on failures.
 
-### Environment Variables
-- OPENAI_API_KEY: API key for OpenAI.
-- AI_MODEL: Model id (default from config).
-- ORION_MAX_COMPLETION_TOKENS: Output token budget (MAX_COMPLETION_TOKENS).
-- ORION_LINE_CAP: Post-apply line cap for follow-up split planning (LINE_CAP).
-- ORION_CONV_CAP_TURNS: Conversation history cap on load (CONV_CAP_TURNS).
-- ORION_SUMMARY_MAX_BYTES: Max bytes for per-file summarization (SUMMARY_MAX_BYTES).
-- ORION_DEP_TTL_SEC: Optional TTL for dependency summary regeneration.
-
-Note: ORION_EXTERNAL_DIR has been removed; the external PD directory is provided via CLI.
+### Conversation Prompt Customization (Project-level)
+- Scope: Conversation turns only; :apply and :splitFile use their packaged prompts.
+- Files (relative to repo root):
+  - .orion/prompt_conversation_system.txt — primary override. If present and non-empty, Orion uses it verbatim as the conversation system prompt.
+  - .orion/prompt_conversation_system.override.txt — secondary override. When the primary override is absent/empty, this replaces the packaged default prompt.
+  - .orion/prompt_conversation_system.addendum.txt — addendum. When the primary override is absent/empty, this text is appended to the active base (packaged default or secondary override).
+- Precedence:
+  1) Use .orion/prompt_conversation_system.txt if present and non-empty.
+  2) Otherwise start from the packaged default (src/orion/workbench/resources/prompt_conversation_system.txt). If .orion/prompt_conversation_system.override.txt exists and is non-empty, it replaces that base.
+  3) Finally, if .orion/prompt_conversation_system.addendum.txt exists and is non-empty, append it to the base in step 2.
+- Fallback: If none of the project-level files are present or they are empty/unreadable, Orion uses the packaged default prompt.
+- Observability: Orion logs a short notice when a project-level override or addendum is applied.
 
 
 <!-- orion: Add CLI usage and commands based on main(); include :clear-changes which exists even if not shown in :help. -->
@@ -280,8 +283,8 @@ Commands:
 <!-- orion: Keep the quality checklist, trimming to items still relevant; remove deprecated references. -->
 ## Quality Checklist
 - Requirements understood or clarified via ask_user.
-- Relevant files discovered (list_paths/search_code) and retrieved as needed.
-- Patches include updated content and `orion:` rationale comments.
+- Relevant files discovered (list_paths/search_files) and retrieved as needed.
+- Patches include updated content and `orion:` rationale comments (code files only).
 - Output JSON validates against the expected schema.
 - Issues array lists uncertainties or blockers.
 
@@ -291,6 +294,6 @@ Commands:
 - When should I use ask_user?
   - When critical details are missing or ambiguous and cannot be inferred safely from context.
 - What tools are available to the model?
-  - list_paths, get_file_contents, search_code, ask_user, and the external PD helpers list_project_descriptions and get_project_orion_summary.
+  - list_paths, get_file_contents, search_files, ask_user, and the external PD helpers list_project_descriptions and get_project_orion_summary.
 - How are file contents provided?
   - Via the authoritative system_state; on :apply, affected files are promoted to kind:"full" so the model sees exact text.

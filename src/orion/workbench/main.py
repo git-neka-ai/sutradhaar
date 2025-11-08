@@ -257,12 +257,14 @@ class Orion:
         ctx.send_to_user(":discard-change <id>  - Discard a pending change by id")
         # orion: Update help text to include :history and both clear commands (:clear-changes and alias :clearChanges) for discoverability.
         ctx.send_to_user(":history              - Show last 10 user↔assistant turns from history")
+        # orion: Add :rerun to replay the most recent user message without adding a duplicate user entry.
+        ctx.send_to_user(":rerun                - Rerun the last user message without duplicating it")
         ctx.send_to_user(":clear-changes        - Clear all pending changes")
         ctx.send_to_user(":clearChanges         - Alias for :clear-changes")
         ctx.send_to_user(":refresh              - Rescan repo and refresh summaries")
         ctx.send_to_user(":refresh-deps         - Refresh Project Orion Summaries for external dependencies")
         ctx.send_to_user(":status               - Show status summary")
-        ctx.send_to_user(":consolidate          - Manually consolidate pending changes")
+        ctx.send_to_user(":consolidate          - Coalesce duplicate change batches")
         ctx.send_to_user(":help                 - Show this help")
         ctx.send_to_user(":quit                 - Exit")
         # orion: Document per-turn model override directive; parsed before command routing and applied only to the next conversation call.
@@ -449,6 +451,122 @@ class Orion:
             if a is not None:
                 ctx.send_to_user(f"Assistant: {a}")
 
+    # orion: Implement :rerun to resend the most recent user message without duplicating it in history.
+    # It rebuilds the message list up to and including that user turn, excluding any later assistant/tool outputs.
+    def cmd_rerun(self, ctx: Context) -> None:
+        # Locate the most recent user message in history
+        last_user_idx: Optional[int] = None
+        for i in range(len(self.history) - 1, -1, -1):
+            m = self.history[i]
+            if m.get("type") == "message" and m.get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx is None:
+            ctx.send_to_user("No previous user message to rerun.")
+            return
+
+        # orion: Ensure system_state exists and is fresh before model calls, as in normal conversation.
+        self._ensure_system_state(ctx)
+
+        # orion: Allow the same project-level prompt customization used in handle_user_input. Duplicated here for clarity.
+        system_text = get_prompt("prompt_conversation_system.txt")
+        try:
+            proj_prompt = read_file(self.repo_root, ".orion/prompt_conversation_system.txt")
+            if proj_prompt.strip():
+                system_text = proj_prompt
+                ctx.log("Using project-level conversation system prompt: .orion/prompt_conversation_system.txt")
+            else:
+                raise ValueError("empty project prompt")
+        except Exception:
+            try:
+                override_text = read_file(self.repo_root, ".orion/prompt_conversation_system.override.txt")
+                if override_text.strip():
+                    system_text = override_text
+                    ctx.log("Using project-level conversation prompt override: .orion/prompt_conversation_system.override.txt")
+            except Exception:
+                pass
+            try:
+                addendum_text = read_file(self.repo_root, ".orion/prompt_conversation_system.addendum.txt")
+                if addendum_text.strip():
+                    system_text = f"{system_text.rstrip()}\n{addendum_text}"
+                    ctx.log("Applied project-level conversation prompt addendum: .orion/prompt_conversation_system.addendum.txt")
+            except Exception:
+                pass
+
+        response_schema = ConversationResponse.model_json_schema()
+
+        # orion: Build messages by trimming history to the last user message (inclusive), excluding any prior system_state echoes.
+        messages: List[Dict[str, Any]] = []
+        latest_state = self._latest_system_state_message()
+        if latest_state:
+            messages.append(latest_state)
+        messages.append({"type": "message", "role": "system", "content": system_text})
+        for idx, h in enumerate(self.history):
+            if idx > last_user_idx:
+                break
+            if h.get("role") == "system":
+                try:
+                    obj = json.loads(h.get("content", ""))
+                    if isinstance(obj, dict) and obj.get("type") == "system_state":
+                        continue
+                except Exception:
+                    pass
+            # orion: Replay up to and including the last user message; do not append a new user entry.
+            msg = h.copy()
+            if "ts" in msg:
+                del msg["ts"]
+            messages.append(msg)
+
+        # Tools and runner mirror normal conversation flow
+        tools: List[Dict[str, Any]] = []
+        tools.extend(self.internal_tool_specs)
+        tools.extend(_external_tool_definitions())
+
+        def runner(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+            reason = str(args.get("reason_for_call") or "")
+            if name in self.internal_tool_names:
+                return run_tool(ctx, name, args)
+            if name == "list_project_descriptions":
+                payload = self._tool_list_pds(ctx)
+                return {"reason_for_call": reason, "result": payload}
+            if name == "get_project_orion_summary":
+                filename = str(args.get("filename") or "")
+                payload = self._tool_get_pos(ctx, filename)
+                return {"reason_for_call": reason, "result": payload}
+            return {"reason_for_call": reason, "result": {"_meta_error": f"unknown tool {name}", "_args_echo": args}}
+
+        def sink(msg: Dict[str, Any]) -> None:
+            self.storage.append_raw_message(msg)
+            self.history.append(msg)
+
+        ctx.log("Calling model for rerun of the last user message...")
+        final_json = self.client.call_responses(
+            ctx,
+            messages,
+            tools,
+            response_schema,
+            interactive_tool_runner=runner,
+            message_sink=sink,
+            call_type="conversation",
+        )
+
+        try:
+            parsed = ConversationResponse.model_validate(final_json)
+        except ValidationError:
+            ctx.log("Model returned invalid conversation response on rerun.")
+            return
+
+        assistant_msg = parsed.assistant_message
+        changes = [c.model_dump() for c in parsed.changes]
+        ctx.send_to_user(assistant_msg)
+        self.storage.append_raw_message({"type":"message", "role": "assistant", "content": assistant_msg})
+        self.history.append({"type":"message", "role": "assistant", "content": assistant_msg})
+
+        if changes:
+            self.md["pending_changes"].extend(changes)
+            self.md["batches_since_last_consolidation"] += 1
+            self.storage.save_metadata(self.md)
+
     # orion: Remove the token counting command (:tokenCount) and its tiktoken dependency; only :splitFile remains.
     # orion: New command to split a file by invoking a dedicated split prompt and applying returned patches immediately.
     def cmd_split_file(self, ctx: Context, path: str) -> None:
@@ -517,7 +635,8 @@ class Orion:
         # Write files and refresh summaries
         written_paths: List[str] = []
         for f in parsed.files:
-            write_file(self.repo_root, f.path, f.code)
+            # orion: Field renamed from 'code' to 'contents'; write the new field.
+            write_file(self.repo_root, f.path, f.contents)
             written_paths.append(f.path)
         if written_paths:
             self._refresh_summaries(ctx, only_paths=written_paths)
@@ -674,7 +793,8 @@ class Orion:
         # Write files
         written_paths: List[str] = []
         for f in parsed.files:
-            write_file(self.repo_root, f.path, f.code)
+            # orion: Field renamed from 'code' to 'contents'; write the new field.
+            write_file(self.repo_root, f.path, f.contents)
             written_paths.append(f.path)
 
         # Commit log entry
@@ -735,6 +855,9 @@ class Orion:
             # orion: Route :history to new cmd_history for compact display of last user↔assistant turns.
             elif cmd == ":history":
                 self.cmd_history(ctx)
+            # orion: Wire :rerun to replay the most recent user message without creating a duplicate entry.
+            elif cmd == ":rerun":
+                self.cmd_rerun(ctx)
             # orion: Use a shared helper for both kebab-case and camelCase clear commands.
             elif cmd == ":clear-changes" or cmd == ":clearChanges":
                 self.cmd_clear_changes(ctx)
@@ -768,8 +891,34 @@ class Orion:
         self.storage.append_raw_message({"type": "message", "role": "user", "content": text})
         self.history.append({"type": "message", "role": "user", "content": text})
 
-        # orion: Load Conversation system prompt from resources so it can be maintained externally.
+        # orion: Allow project-level conversation prompt customization with clear precedence and safe fallbacks.
+        # Priority:
+        # 1) Use .orion/prompt_conversation_system.txt if present and non-empty (verbatim, conversation-only scope).
+        # 2) Else start from packaged default; if .orion/prompt_conversation_system.override.txt exists and is non-empty, replace base.
+        # 3) Then, if .orion/prompt_conversation_system.addendum.txt exists and is non-empty, append to the base.
         system_text = get_prompt("prompt_conversation_system.txt")
+        try:
+            proj_prompt = read_file(self.repo_root, ".orion/prompt_conversation_system.txt")
+            if proj_prompt.strip():
+                system_text = proj_prompt
+                ctx.log("Using project-level conversation system prompt: .orion/prompt_conversation_system.txt")
+            else:
+                raise ValueError("empty project prompt")
+        except Exception:
+            try:
+                override_text = read_file(self.repo_root, ".orion/prompt_conversation_system.override.txt")
+                if override_text.strip():
+                    system_text = override_text
+                    ctx.log("Using project-level conversation prompt override: .orion/prompt_conversation_system.override.txt")
+            except Exception:
+                pass
+            try:
+                addendum_text = read_file(self.repo_root, ".orion/prompt_conversation_system.addendum.txt")
+                if addendum_text.strip():
+                    system_text = f"{system_text.rstrip()}\n{addendum_text}"
+                    ctx.log("Applied project-level conversation prompt addendum: .orion/prompt_conversation_system.addendum.txt")
+            except Exception:
+                pass
 
         # orion: Replace inline JSON Schema with centralized Pydantic model schema.
         response_schema = ConversationResponse.model_json_schema()
@@ -884,6 +1033,7 @@ class Orion:
 
 
 # orion: Update docstring to reflect CLI-driven external directory configuration and revised help text.
+
 def main() -> None:
     """
     Orion CLI entrypoint.

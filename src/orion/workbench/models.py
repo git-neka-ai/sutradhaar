@@ -95,11 +95,12 @@ class ConversationResponse(CustomBaseModel):
     changes: List[ChangeSpec] = Field(..., description="List of proposed change specifications")
 
 
-class FilePatch(CustomBaseModel):
+# orion: Rename FilePatch to FileContents and field 'code' to 'contents' to reflect whole-file replacement semantics.
+class FileContents(CustomBaseModel):
 
-    path: str = Field(..., description="File path to patch")
+    path: str = Field(..., description="File path to write")
     is_new: bool = Field(..., description="Whether the file is newly created")
-    code: str = Field(..., description="Patch code")
+    contents: str = Field(..., description="File contents")
 
     # orion: Normalize output file paths before writing to disk to match prior behavior.
     @field_validator("path")
@@ -123,5 +124,6 @@ class ApplyResponse(CustomBaseModel):
 
     mode: Literal["ok", "incompatible"] = Field(..., description="Status of the apply operation")
     explanation: str = Field(..., description="Explanation of the apply status")
-    files: List[FilePatch] = Field(..., description="List of file patches to apply")
+    # orion: Update ApplyResponse.files to use FileContents after type rename.
+    files: List[FileContents] = Field(..., description="List of file contents to apply")
     issues: List[Issue] = Field(..., description="List of issues encountered during apply")

@@ -162,9 +162,9 @@ def get_file_contents(ctx: Context, path: str) -> Dict[str, Any]:
     return {"path": np, "content": content, "line_count": count_lines(content)}
 
 
-# orion: search_code performs a linear substring scan (case-insensitive) across non-ignored files.
-@tool(name="search_code", description="Search files for a substring; returns paths.")
-def search_code(ctx: Context, query: str, max_results: int = 100) -> Dict[str, Any]:
+# orion: Rename tool from search_code to search_files to unify tool naming across code and docs; behavior unchanged.
+@tool(name="search_files", description="Search files for a substring; returns paths.")
+def search_files(ctx: Context, query: str, max_results: int = 100) -> Dict[str, Any]:
     q = (query or "").lower()
     if not q:
         return {"matches": []}

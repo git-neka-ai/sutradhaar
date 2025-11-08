@@ -13,8 +13,11 @@ from pydantic import BaseModel
 # orion: Add pathlib and time for optional .httpcalls request/response logging to REST Client .http files.
 import pathlib
 import time
+# orion: Import random to provide exponential backoff jitter for retries on timeouts and HTTP 5xx.
+import random
 
 # orion: Introduce a centralized OpenAI schema preprocessor that (1) removes sibling keys alongside $ref and (2) enforces strict object-shape requirements by ensuring required includes all property keys and additionalProperties=False for any node with properties.
+
 def _preprocess_for_openai(schema: dict) -> dict:
     """
     Prepare a JSON Schema for OpenAI strict validation:
@@ -98,7 +101,7 @@ class ChatCompletionsClient:
         message_sink=None,
         call_type: str = "minimal",
         model: Optional[str] = None,
-        _timeout: int = 240,
+        _timeout: int = 1800,
     ) -> Dict[str, Any]:
         """
         Invoke the Responses API and normalize the result into a strict JSON object. 
@@ -166,10 +169,35 @@ class ChatCompletionsClient:
                     return obj
             return None
 
+        # orion: Upsert system_state within the current call to keep exactly one system_state message in local_messages.
+        # If a system_state exists, replace it in-place; otherwise append. We still sink to persist the upgrade across turns.
         def _append_system_state(obj: Dict[str, Any]) -> None:
+            # orion: Build the canonical message and replace the existing system_state rather than appending duplicates.
             msg = {"type": "message", "role": "system", "content": json.dumps(obj, ensure_ascii=False)}
+            # Find the most recent system_state message index (if any)
+            idx: Optional[int] = None
+            for i in range(len(local_messages) - 1, -1, -1):
+                m = local_messages[i]
+                if m.get("role") != "system":
+                    continue
+                content = m.get("content")
+                if not isinstance(content, str):
+                    continue
+                try:
+                    parsed = json.loads(content)
+                except Exception:
+                    continue
+                if isinstance(parsed, dict) and parsed.get("type") == "system_state":
+                    idx = i
+                    break
+            if idx is not None:
+                # orion: Replace in-place to dedupe system_state for this in-flight call.
+                local_messages[idx] = msg
+            else:
+                # orion: No prior system_state in this call; append the first one.
+                local_messages.append(msg)
+            # orion: Persist the upgraded system_state so subsequent turns start from the latest state.
             _sink(msg)
-            local_messages.append(msg)
 
         def _make_payload() -> Dict[str, Any]:
             # orion: Keep the same json_schema format you already use; Responses nests it under text.format.
@@ -290,34 +318,73 @@ class ChatCompletionsClient:
                 http_file = None  # Non-fatal: proceed without logging
 
             # orion: Conservative timeout to accommodate tool loops; Responses may stream chunks server-side.
-            t0 = time.time()
-            r = self.session.post(url, json=payload, timeout=_timeout)
-            elapsed_ms = int((time.time() - t0) * 1000)
+            # orion: Wrap the POST in a bounded retry loop for transient failures (timeouts, HTTP 5xx). 4xx errors are not retried.
+            max_retries = 3
+            attempt = 0
+            last_exc: Optional[Exception] = None
+            r = None
+            while True:
+                attempt += 1
+                t0 = time.time()
+                try:
+                    r = self.session.post(url, json=payload, timeout=_timeout)
+                    elapsed_ms = int((time.time() - t0) * 1000)
 
-            # orion: Append a response section to the same .http file with status, headers, body, and elapsed time (non-fatal on errors).
-            try:
-                if http_file is not None:
-                    with open(http_file, "a", encoding="utf-8") as f:
-                        f.write("\n\n### Response — elapsed_ms: " + str(elapsed_ms) + "\n")
-                        # Best-effort HTTP status line; requests doesn't expose HTTP version reliably.
-                        f.write(f"HTTP/1.1 {r.status_code} {getattr(r, 'reason', '')}\n")
-                        for hk, hv in r.headers.items():
-                            try:
-                                f.write(f"{hk}: {hv}\n")
-                            except Exception:
-                                continue
-                        f.write("\n")
+                    # orion: Append a response section to the same .http file with status, headers, body, and elapsed time (non-fatal on errors).
+                    try:
+                        if http_file is not None:
+                            with open(http_file, "a", encoding="utf-8") as f:
+                                f.write("\n\n### Response — elapsed_ms: " + str(elapsed_ms) + "\n")
+                                # Best-effort HTTP status line; requests doesn't expose HTTP version reliably.
+                                f.write(f"HTTP/1.1 {r.status_code} {getattr(r, 'reason', '')}\n")
+                                for hk, hv in r.headers.items():
+                                    try:
+                                        f.write(f"{hk}: {hv}\n")
+                                    except Exception:
+                                        continue
+                                f.write("\n")
+                                try:
+                                    f.write(r.text)
+                                except Exception:
+                                    # Fallback if body can't be decoded as text
+                                    f.write("<binary/undecodable body>\n")
+                    except Exception:
+                        pass  # Non-fatal
+
+                    # Handle status codes
+                    if r.status_code == 200:
+                        break  # success
+                    if r.status_code >= 500 and attempt <= max_retries:
+                        # orion: Retry on server errors with exponential backoff and jitter to smooth contention.
+                        base_delay = [1.0, 2.0, 4.0][min(attempt - 1, 2)]
+                        delay = base_delay * random.uniform(0.5, 1.5)
                         try:
-                            f.write(r.text)
+                            ctx.log(f"Responses API attempt {attempt} received {r.status_code}; retrying in {delay:.2f}s...")
                         except Exception:
-                            # Fallback if body can't be decoded as text
-                            f.write("<binary/undecodable body>\n")
-            except Exception:
-                pass  # Non-fatal
+                            pass
+                        time.sleep(delay)
+                        continue
+                    # Do not retry for 4xx; raise immediately with truncated body for diagnostics.
+                    if r.status_code != 200:
+                        raise RuntimeError(f"Responses API error {r.status_code}: {r.text[:2000]}")
+                except requests.exceptions.Timeout as e:
+                    last_exc = e
+                    if attempt <= max_retries:
+                        base_delay = [1.0, 2.0, 4.0][min(attempt - 1, 2)]
+                        delay = base_delay * random.uniform(0.5, 1.5)
+                        try:
+                            ctx.log(f"Responses API timeout on attempt {attempt}; retrying in {delay:.2f}s...")
+                        except Exception:
+                            pass
+                        time.sleep(delay)
+                        continue
+                    # Retries exhausted
+                    raise RuntimeError(f"Responses API timeout after {attempt} attempt(s): {e}")
+                # Exit inner retry loop on success
+                break
 
-            if r.status_code != 200:
-                # orion: Surface first 2KB of body for fast diagnostics without overwhelming logs.
-                raise RuntimeError(f"Responses API error {r.status_code}: {r.text[:2000]}")
+            if r is None:
+                raise RuntimeError("Responses API: no response object after retries.")
 
             resp = r.json()
 
@@ -420,6 +487,7 @@ class ChatCompletionsClient:
 
 
 # orion: Add a docstring to clarify intent, parameters, and failure behavior (non-throwing; logs to stderr via prints).
+
 def dumpHttpFile(file: str, url: str, method: str, headers: Dict[str, str], obj: Any) -> None:
     """
     Write a human-readable HTTP request dump to disk for debugging.

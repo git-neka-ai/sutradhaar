@@ -10,7 +10,7 @@ Your task:
 - If the original file should remain, include its updated contents as one of the returned files.
 
 Output rules (very important):
-- Return a strict ApplyResponse JSON with: mode="ok", files=[{path,is_new,code}], issues=[] and an explanation.
+- Return a strict ApplyResponse JSON with: mode="ok", files=[{path,is_new,contents}], issues=[] and an explanation.
 - Do not include any extra fields or metadata.
 - Do not ask for confirmation; make the best split you can with the provided input.
 - Do not insert any "orion:" comments or boilerplate into prose files (e.g., .md, .txt). For code files, brief rationale comments are acceptable.
