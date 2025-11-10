@@ -11,7 +11,8 @@ requires-python = ">=3.11"
 # orion: Remove tiktoken dependency now that :tokenCount was removed to avoid installation/runtime issues and reduce optional deps.
 dependencies = [
   "requests>=2.31,<3",
-  "pydantic>=2,<3"
+  "pydantic>=2,<3",
+  "PyYAML>=6.0"
 ]
 
 # CLI entry points (optional; add one per module bootstrap)

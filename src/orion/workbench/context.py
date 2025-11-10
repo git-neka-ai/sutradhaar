@@ -18,9 +18,11 @@ class Context:
     """
 
     # orion: Add trivial docstring for completeness and future extension.
-    def __init__(self, repo_root: pathlib.Path) -> None:
-        """Initialize a default console-based context."""
+    def __init__(self, repo_root: pathlib.Path, settings: Optional[Dict[str, Any]] = None) -> None:
+        """Initialize a default console-based context with optional settings."""
         self.repo_root = repo_root
+        # orion: Expose settings loaded from .orion/settings.yaml to enable runtime toggles and overrides.
+        self.settings: Dict[str, Any] = settings or {}
 
     # orion: Clarify side-effect: prints to stdout.
     def send_to_user(self, message: str) -> None:

@@ -65,20 +65,21 @@ def _preprocess_for_openai(schema: dict) -> dict:
 
 class ChatCompletionsClient:
     # orion: Updated client to indicate Responses-only usage; Chat Completions helpers were removed during cleanup.
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(self, api_key: str, model: str, base_url: Optional[str] = None) -> None:
         """
         Initialize a minimal HTTP client for OpenAI's Responses API.
 
         Args:
             api_key: Secret API key for authentication.
             model: Default model name to use when a call does not override it.
+            base_url: Optional API base URL override. Defaults to https://api.openai.com/v1.
 
         Raises:
             RuntimeError: If api_key or model are not provided.
         """
         if not (api_key and model):
             raise RuntimeError("OpenAI env missing. Set OPENAI_API_KEY and AI_MODEL.")
-        self.base_url = "https://api.openai.com/v1"
+        self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
         self.api_key = api_key
         self.model = model
         self.session = requests.Session()
@@ -218,7 +219,7 @@ class ChatCompletionsClient:
             payload["tools"] = tools.copy() if tools else []
             payload["tool_choice"] = "auto"
             if reasoning_effort != "minimal":
-                payload["tools"].append({"type":"web_search"})
+                payload["tools"].append({"type": "web_search"})
             return payload
 
         def _extract_msg_obj(resp_obj: Dict[str, Any]) -> Dict[str, Any]:
@@ -302,18 +303,43 @@ class ChatCompletionsClient:
             # orion: Build payload once per POST so logging captures the exact body sent.
             payload = _make_payload()
 
-            # orion: If repo_root/.httpcalls exists, write the request in REST Client format with redacted Authorization.
+            # orion: If logging is enabled, write the request in REST Client format with redacted Authorization.
             try:
-                httpcalls_dir = (pathlib.Path(ctx.repo_root) / ".httpcalls").resolve()
-                if httpcalls_dir.exists() and httpcalls_dir.is_dir():
-                    ts_ms = int(time.time() * 1000)
-                    http_file = httpcalls_dir / f"call-{ts_ms}.http"
-                    # Prepare headers with Authorization redacted for safe-at-rest logging.
-                    headers_for_log = dict(self.session.headers)
-                    headers_for_log["Authorization"] = "Bearer {{OPENAI_API_KEY}}"
-                    dumpHttpFile(str(http_file), url, "POST", headers_for_log, payload)
+                http_file = None
+                settings = getattr(ctx, "settings", {}) or {}
+                log_cfg = {}
+                if isinstance(settings, dict):
+                    log_cfg = ((settings.get("logging") or {}).get("httpcalls") or {})
+                enabled = log_cfg.get("enabled") if isinstance(log_cfg, dict) else None
+                custom_dir = log_cfg.get("dir") if isinstance(log_cfg, dict) else None
+
+                # Determine directory and behavior based on settings
+                if enabled is False:
+                    http_file = None  # explicit off
                 else:
-                    http_file = None
+                    # Compute target directory
+                    base_dir: Optional[pathlib.Path] = None
+                    if enabled is True:
+                        if custom_dir:
+                            cpath = pathlib.Path(str(custom_dir))
+                            base_dir = cpath if cpath.is_absolute() else (pathlib.Path(ctx.repo_root) / cpath)
+                        else:
+                            base_dir = pathlib.Path(ctx.repo_root) / ".httpcalls"
+                        # Ensure directory exists when explicitly enabled
+                        base_dir.mkdir(parents=True, exist_ok=True)
+                    else:
+                        # Back-compat: only log if default dir already exists
+                        maybe = pathlib.Path(ctx.repo_root) / ".httpcalls"
+                        if maybe.exists() and maybe.is_dir():
+                            base_dir = maybe
+
+                    if base_dir is not None:
+                        ts_ms = int(time.time() * 1000)
+                        http_file_path = base_dir / f"call-{ts_ms}.http"
+                        headers_for_log = dict(self.session.headers)
+                        headers_for_log["Authorization"] = "Bearer {{OPENAI_API_KEY}}"
+                        dumpHttpFile(str(http_file_path), url, "POST", headers_for_log, payload)
+                        http_file = http_file_path
             except Exception:
                 http_file = None  # Non-fatal: proceed without logging
 

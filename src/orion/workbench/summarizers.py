@@ -139,6 +139,13 @@ def summarize_file(ctx: Context, client: ChatCompletionsClient, repo_root: pathl
         b64 = base64.b64encode(data).decode("ascii")
         data_url = f"data:{mime};base64,{b64}"
 
+        # orion: Allow per-repo override of the image model via settings.yaml under api.image_model.
+        try:
+            image_model = ((ctx.settings or {}).get("api") or {}).get("image_model")
+        except Exception:
+            image_model = None
+        chosen_image_model = image_model or AI_IMAGE_SUMMARY_MODEL
+
         messages = [
             {"role": "system", "content": system_txt},
             {
@@ -159,7 +166,7 @@ def summarize_file(ctx: Context, client: ChatCompletionsClient, repo_root: pathl
             max_completion_tokens=None,
             interactive_tool_runner=None,
             call_type="image_summary",
-            model=AI_IMAGE_SUMMARY_MODEL,
+            model=chosen_image_model,
         )
 
         try:

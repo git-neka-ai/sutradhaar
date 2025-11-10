@@ -27,6 +27,7 @@ from .summarizers import ensure_all_pos, summarize_file
 # orion: Switch to reflective tool utilities; individual tool functions are no longer imported or wired here.
 from .tools import discover_tools, list_tool_names, run_tool
 from .prompts import get_prompt
+from .settings import load_settings
 
 # orion: Import centralized Pydantic models and validation utilities; this replaces ad-hoc schema dicts.
 from pydantic import ValidationError, TypeAdapter
@@ -152,7 +153,13 @@ class Orion:
         self.storage = Storage(self.repo_root)
         self.md = self.storage.load_metadata()
         self.history = self.storage.load_history()
-        self.client = ChatCompletionsClient(OPENAI_API_KEY, AI_MODEL)
+        # orion: Load settings once; expose on Context and use for client overrides.
+        self.settings = load_settings(self.repo_root)
+        api_cfg = self.settings.get("api") if isinstance(self.settings, dict) else None
+        model_override = (api_cfg or {}).get("model") if isinstance(api_cfg, dict) else None
+        base_url_override = (api_cfg or {}).get("base_url") if isinstance(api_cfg, dict) else None
+        chosen_model = model_override or AI_MODEL
+        self.client = ChatCompletionsClient(OPENAI_API_KEY, chosen_model, base_url=base_url_override)
 
         # orion: Resolve the external dependency root from the CLI-provided value only (environment variable removed).
         self.ext_root: Optional[pathlib.Path] = ext_dir_valid(external_dir)
@@ -449,7 +456,7 @@ class Orion:
         self.storage.save_metadata(self.md)
         ctx.log(f"Consolidated. Pending changes now: {len(self.md['pending_changes'])}")
 
-    # orion: Add helper used by both :clear-changes and :clearChanges to clear pending changes and persist.
+    # orion: Add helper used by both :clear-changes and :clearChanges to clear pending changes and persist metadata.
     def cmd_clear_changes(self, ctx: Context) -> None:
         """Clear all pending changes and persist metadata."""
         self.md["pending_changes"] = []
@@ -1062,7 +1069,7 @@ class Orion:
                 print("Tip: add .httpcalls to .gitignore to avoid committing request logs.")
         except Exception:
             pass
-        ctx = Context(self.repo_root)
+        ctx = Context(self.repo_root, settings=self.settings)
         while True:
             try:
                 text = input("> ").strip()
