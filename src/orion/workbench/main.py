@@ -221,11 +221,14 @@ class Orion:
                 {"id": a.get("id"), "ts": a.get("ts"), "s": a.get("s", "")} for a in recent_archives
             ]
         }
+        # Pending changes: expose current list so the model can consult/modify them per turn
+        pending_changes = self.md.get("pending_changes", []) if isinstance(self.md, dict) else []
         payload: Dict[str, Any] = {
             "type": "system_state",
             "version": 1,
             "files": files_map,
             "conversations": conv_obj,
+            "pending_changes": pending_changes,
         }
         return {"type": "message", "role": "system", "content": json.dumps(payload, ensure_ascii=False)}
 
@@ -467,6 +470,58 @@ class Orion:
         self.storage.save_metadata(self.md)
         ctx.log(f"Consolidated. Pending changes now: {len(self.md['pending_changes'])}")
 
+    # orion: Merge helper for pending ChangeSpecs. Replaces by id, deletes on empty items, appends new ids.
+    def _merge_pending_changes(self, ctx: Context, new_changes: List[Dict[str, Any]]) -> None:
+        """Merge a list of ChangeSpecs into the pending set with deterministic semantics.
+
+        Rules:
+          - If an incoming ChangeSpec's id matches an existing one:
+              * items == []  -> delete that spec
+              * items != []  -> replace that spec (entire object)
+          - If the id does not exist:
+              * items == []  -> ignore (no-op)
+              * items != []  -> append as new
+        """
+        if not new_changes:
+            return
+        normalized = validate_change_specs(new_changes)
+        if not normalized:
+            ctx.log("No valid change specs to merge.")
+            return
+        existing_list = self.md.get("pending_changes", [])
+        existing_map: Dict[str, Dict[str, Any]] = {
+            c.get("id"): c for c in existing_list if isinstance(c, dict) and c.get("id")
+        }
+        replaced = 0
+        deleted = 0
+        appended = 0
+        for nc in normalized:
+            cid = nc.get("id")
+            items = nc.get("items", [])
+            if not cid:
+                continue
+            if cid in existing_map:
+                if len(items) == 0:
+                    del existing_map[cid]
+                    deleted += 1
+                else:
+                    existing_map[cid] = nc
+                    replaced += 1
+            else:
+                if len(items) == 0:
+                    # deletion request for non-existent id: no-op
+                    continue
+                existing_map[cid] = nc
+                appended += 1
+        new_list = list(existing_map.values())
+        if new_list != existing_list:
+            self.md["pending_changes"] = new_list
+            self.md["batches_since_last_consolidation"] += 1
+            self.storage.save_metadata(self.md)
+            ctx.log(f"Merged pending changes: +{appended}, ~{replaced}, -{deleted}")
+        else:
+            ctx.log("No changes to pending changes after merge.")
+
     # orion: Add helper used by both :clear-changes and :clearChanges to clear pending changes and persist metadata.
     def cmd_clear_changes(self, ctx: Context) -> None:
         """Clear all pending changes and persist metadata."""
@@ -621,9 +676,7 @@ class Orion:
         self.history.append({"type":"message", "role": "assistant", "content": assistant_msg})
 
         if changes:
-            self.md["pending_changes"].extend(changes)
-            self.md["batches_since_last_consolidation"] += 1
-            self.storage.save_metadata(self.md)
+            self._merge_pending_changes(ctx, changes)
 
     # orion: Remove the token counting command (:tokenCount) and its tiktoken dependency; only :splitFile remains.
     # orion: New command to split a file by invoking a dedicated split prompt and applying returned patches immediately.
@@ -1108,9 +1161,7 @@ class Orion:
         self.history.append({"type":"message", "role": "assistant", "content": assistant_msg})
 
         if changes:
-            self.md["pending_changes"].extend(changes)
-            self.md["batches_since_last_consolidation"] += 1
-            self.storage.save_metadata(self.md)
+            self._merge_pending_changes(ctx, changes)
 
     def run(self) -> None:
         """Start the interactive REPL loop for Orion."""

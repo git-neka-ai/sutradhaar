@@ -4,3 +4,7 @@
 - Return a strict JSON object that matches the provided schema exactly. Do not add fields; arrays may be empty.
 - Use the available tools, and prefer batching the tool calls you need rather than calling them one by one when possible.
 - Only ask for tool invocations if you don't find the result you are looking for already in your input. eg: you might have already fetched a file, no need to fetch it again. You can assume things don't change while you are working. 
+- Before proposing changes, consult system_state.pending_changes to avoid duplicates and to edit or remove existing specs when appropriate.
+- To modify an existing ChangeSpec, return one with the same id and updated fields; Orion will replace the existing spec with your version.
+- To delete an existing ChangeSpec, return one with the same id and set items: [] (an empty array).
+- Any ChangeSpec with a new id will be appended.
