@@ -36,6 +36,7 @@ from .models import (
     ApplyResponse,
     ChangeSpec,
     ChangeItem,
+    InfoSummary,
 )
 
 
@@ -212,10 +213,19 @@ class Orion:
                 except Exception:
                     summ = None
             files_map[p] = {"kind": "summary", "body": summ, "meta": {"has_summary": bool(summ)}}
+        # Conversations: include last 5 archived summaries (id, ts, s)
+        archives = self.md.get("conversation_archives", []) if isinstance(self.md, dict) else []
+        recent_archives = archives[-5:] if archives else []
+        conv_obj = {
+            "recent_archives": [
+                {"id": a.get("id"), "ts": a.get("ts"), "s": a.get("s", "")} for a in recent_archives
+            ]
+        }
         payload: Dict[str, Any] = {
             "type": "system_state",
             "version": 1,
             "files": files_map,
+            "conversations": conv_obj,
         }
         return {"type": "message", "role": "system", "content": json.dumps(payload, ensure_ascii=False)}
 
@@ -439,6 +449,7 @@ class Orion:
         ctx.send_to_user(f"Tracked digests: {len(self.md.get('path_to_digest', {}))}")
         if self.ext_root:
             ctx.send_to_user(f"External PD root: {self.ext_root} (flat). PD files: {dep_count}")
+        ctx.send_to_user(f"Archived conversations: {len(self.md.get('conversation_archives', []))}")
 
     def cmd_consolidate(self, ctx: Context) -> None:
         """Coalesce duplicate change batches and reset the consolidation counter."""
@@ -855,8 +866,62 @@ class Orion:
         if written_paths:
             self._refresh_summaries(ctx, only_paths=written_paths)
 
-        # Clear conversation and pending changes
-        self.storage.clear_history()
+        # Archive-time summary and rotation
+        try:
+            # Append an apply-role marker with changed paths
+            apply_marker = {"type": "message", "role": "apply", "content": json.dumps(written_paths, ensure_ascii=False)}
+            self.storage.append_raw_message(apply_marker)
+            self.history.append(apply_marker)
+
+            # Build transcript of user/assistant/apply messages only
+            transcript: List[Dict[str, str]] = []
+            for m in self.history:
+                if m.get("type") == "message" and m.get("role") in ("user", "assistant", "apply"):
+                    transcript.append({
+                        "role": str(m.get("role")),
+                        "content": str(m.get("content", ""))
+                    })
+
+            # Summarize via InfoSummary using the archive prompt
+            archive_system = get_prompt("prompt_archive_summary_system.txt")
+            archive_schema = InfoSummary.model_json_schema()
+            archive_messages = [
+                {"role": "system", "content": archive_system},
+                {"role": "user", "content": json.dumps({"transcript": transcript}, ensure_ascii=False)},
+            ]
+            archive_json = self.client.call_responses(
+                ctx,
+                messages=archive_messages,
+                tools=[],
+                response_schema=archive_schema,
+                call_type="archive_summary",
+            )
+            try:
+                info = InfoSummary.model_validate(archive_json)
+                summary_text = info.s
+            except ValidationError:
+                summary_text = f"Applied {len(written_paths)} change(s)."
+
+            # Rotate current conversation to a stable-id backup and record metadata
+            archive_id = short_id("conv")
+            backup_path = self.storage.clear_history(archive_id)
+            record = {
+                "id": archive_id,
+                "ts": now_ts(),
+                "filename": str(backup_path) if backup_path else "",
+                "s": summary_text,
+            }
+            archives = self.md.get("conversation_archives", [])
+            archives.append(record)
+            if len(archives) > 200:
+                archives = archives[-200:]
+            self.md["conversation_archives"] = archives
+            self.storage.save_metadata(self.md)
+        except Exception:
+            # Non-fatal: proceed with cleanup even if archiving/summarization fails
+            pass
+
+        # Clear conversation and pending changes (history already rotated above)
         self.history = []
         self.md["pending_changes"] = []
         self.md["batches_since_last_consolidation"] = 0

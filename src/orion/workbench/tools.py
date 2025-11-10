@@ -6,7 +6,7 @@ import pathlib
 from typing import Any, Dict, List, Optional, Callable, get_type_hints
 
 from .context import Context
-from .fs import list_repo_paths, normalize_path, read_file, count_lines
+from .fs import list_repo_paths, normalize_path, read_file, count_lines, read_json, read_jsonl
 
 # -----------------------------
 # Reflection utilities and registry
@@ -191,3 +191,46 @@ def ask_user(ctx: Context, prompt: str) -> Dict[str, Any]:
     except EOFError:
         ans = ""
     return {"answer": ans}
+
+
+# orion: Fetch an archived conversation by id and return filtered records.
+@tool(name="get_archived_conversation_details", description="Get archived conversation by id; returns {id, filename, records:[{ts, role, content}]} filtered to roles user, assistant, apply.")
+def get_archived_conversation_details(ctx: Context, id: str) -> Dict[str, Any]:
+    try:
+        md = read_json(ctx.repo_root / ".orion" / "orion-metadata.json", {})
+    except Exception:
+        return {"_meta_error": "could not read metadata"}
+    archives = md.get("conversation_archives") or []
+    rec = None
+    for a in archives:
+        if str(a.get("id")) == str(id):
+            rec = a
+            break
+    if not rec:
+        return {"_meta_error": "archive id not found"}
+    filename = rec.get("filename") or ""
+    try:
+        # Resolve path safely; enforce it lives under .orion
+        p = pathlib.Path(filename)
+        if not p.is_absolute():
+            p = (ctx.repo_root / filename).resolve()
+        if ".orion" not in p.parts:
+            return {"_meta_error": "invalid archive path"}
+        rows = read_jsonl(p)
+    except Exception:
+        return {"_meta_error": "could not read archived conversation"}
+    records: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("type") != "message":
+            continue
+        role = row.get("role")
+        if role not in ("user", "assistant", "apply"):
+            continue
+        records.append({
+            "ts": row.get("ts"),
+            "role": role,
+            "content": row.get("content", ""),
+        })
+    return {"id": rec.get("id"), "filename": filename, "records": records}

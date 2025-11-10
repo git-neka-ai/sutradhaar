@@ -68,7 +68,9 @@ class Storage:
             "pending_changes": [],
             "batches_since_last_consolidation": 0,
             # summaries support
-            "path_to_digest": {}
+            "path_to_digest": {},
+            # archived conversation summaries
+            "conversation_archives": [],
         }
 
     # orion: Clarify how legacy keys are culled and how missing keys are populated.
@@ -88,6 +90,8 @@ class Storage:
             md["batches_since_last_consolidation"] = 0
         if "path_to_digest" not in md:
             md["path_to_digest"] = {}
+        if "conversation_archives" not in md:
+            md["conversation_archives"] = []
         # purge any legacy keys if present
         md.pop("summaries_by_digest", None)
         return md
@@ -128,8 +132,17 @@ class Storage:
         append_jsonl(self.conv_file, entry)
 
     # orion: Add docstring explaining rotation behavior and rationale (keeps a backup for debugging/audit).
-    def clear_history(self) -> None:
-        """Rotate the current conversation JSONL to a timestamped .bak.jsonl file if present."""
+    def clear_history(self, archive_id: Optional[str] = None) -> Optional[pathlib.Path]:
+        """Rotate the current conversation JSONL to a backup .bak.jsonl file if present.
+
+        If archive_id is provided, the backup will be named
+        .orion/orion-conversation-<archive_id>.bak.jsonl; otherwise a timestamp is used.
+
+        Returns the pathlib.Path to the backup file when rotation occurs, else None.
+        """
         if self.conv_file.exists():
-            backup = self.conv_file.with_name(f"{self.conv_file.stem}-{int(now_ts())}.bak.jsonl")
+            suffix = archive_id if archive_id else str(int(now_ts()))
+            backup = self.conv_file.with_name(f"{self.conv_file.stem}-{suffix}.bak.jsonl")
             shutil.move(str(self.conv_file), str(backup))
+            return backup
+        return None
