@@ -9,7 +9,7 @@ import json
 import pathlib
 from typing import Any, Dict, List, Optional
 
-from .config import OPENAI_API_KEY, AI_MODEL, LINE_CAP
+from .config import LINE_CAP
 from .context import Context, Storage
 from .client import ChatCompletionsClient
 from .external import ext_dir_valid, list_project_descriptions
@@ -156,11 +156,8 @@ class Orion:
         self.history = self.storage.load_history()
         # orion: Load settings once; expose on Context and use for client overrides.
         self.settings = load_settings(self.repo_root)
-        api_cfg = self.settings.get("api") if isinstance(self.settings, dict) else None
-        model_override = (api_cfg or {}).get("model") if isinstance(api_cfg, dict) else None
-        base_url_override = (api_cfg or {}).get("base_url") if isinstance(api_cfg, dict) else None
-        chosen_model = model_override or AI_MODEL
-        self.client = ChatCompletionsClient(OPENAI_API_KEY, chosen_model, base_url=base_url_override)
+        # orion: Autodetect provider and values in the client using settings and env; no need to pass base_url explicitly.
+        self.client = ChatCompletionsClient(settings=self.settings)
 
         # orion: Resolve the external dependency root from the CLI-provided value only (environment variable removed).
         self.ext_root: Optional[pathlib.Path] = ext_dir_valid(external_dir)

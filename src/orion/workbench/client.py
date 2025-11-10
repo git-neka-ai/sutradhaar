@@ -15,6 +15,8 @@ import pathlib
 import time
 # orion: Import random to provide exponential backoff jitter for retries on timeouts and HTTP 5xx.
 import random
+# orion: Import os for environment-based provider detection and secrets.
+import os
 
 # orion: Introduce a centralized OpenAI schema preprocessor that (1) removes sibling keys alongside $ref and (2) enforces strict object-shape requirements by ensuring required includes all property keys and additionalProperties=False for any node with properties.
 
@@ -65,30 +67,103 @@ def _preprocess_for_openai(schema: dict) -> dict:
 
 class ChatCompletionsClient:
     # orion: Updated client to indicate Responses-only usage; Chat Completions helpers were removed during cleanup.
-    def __init__(self, api_key: str, model: str, base_url: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        settings: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """
-        Initialize a minimal HTTP client for OpenAI's Responses API.
+        Initialize a minimal HTTP client for OpenAI's Responses API with provider autodetection.
 
-        Args:
-            api_key: Secret API key for authentication.
-            model: Default model name to use when a call does not override it.
-            base_url: Optional API base URL override. Defaults to https://api.openai.com/v1.
+        Provider selection precedence (highest first):
+          1) Constructor args (api_key/model/base_url)
+          2) settings['api'] values (provider, api_key, model, base_url)
+          3) Environment
+             - OpenAI: OPENAI_API_KEY, AI_MODEL, OPENAI_BASE_URL
+             - Azure:  AZURE_OPENAI_API_KEY, AZURE_OPENAI_MODEL, AZURE_OPENAI_ENDPOINT
 
-        Raises:
-            RuntimeError: If api_key or model are not provided.
+        Provider detection rules:
+          - If settings['api']['provider'] is 'azure' or 'openai', use it.
+          - Else if Azure env hints exist (AZURE_OPENAI_API_KEY or AZURE_OPENAI_ENDPOINT) or
+            base_url looks like an Azure endpoint, use 'azure'.
+          - Otherwise default to 'openai'.
+
+        Base URL normalization:
+          - OpenAI: default https://api.openai.com/v1 ("/v1" suffix ensured)
+          - Azure:  {endpoint}/openai/v1 ("/openai/v1" suffix ensured)
+
+        Auth headers:
+          - OpenAI: Authorization: Bearer <OPENAI_API_KEY>
+          - Azure:  api-key: <AZURE_OPENAI_API_KEY>
         """
-        if not (api_key and model):
-            raise RuntimeError("OpenAI env missing. Set OPENAI_API_KEY and AI_MODEL.")
-        self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
-        self.api_key = api_key
-        self.model = model
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {self.api_key}",
+
+        api_cfg = (settings or {}).get("api") if isinstance(settings, dict) else None
+        api_cfg = api_cfg if isinstance(api_cfg, dict) else {}
+
+        # Determine provider
+        provider: Optional[str] = str(api_cfg.get("provider") or "").strip().lower() or None
+
+        def _looks_like_azure(url: Optional[str]) -> bool:
+            if not url:
+                return False
+            u = url.lower()
+            return ("azure.com" in u) or ("/openai/" in u) or ("openai.azure.com" in u)
+
+        if provider not in ("azure", "openai"):
+            if (os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_ENDPOINT")) or _looks_like_azure(base_url or api_cfg.get("base_url")):
+                provider = "azure"
+            else:
+                provider = "openai"
+
+        # Resolve values with precedence: args > settings > env
+        resolved_model: Optional[str]
+        resolved_api_key: Optional[str]
+        resolved_base_url: Optional[str]
+
+        if provider == "azure":
+            resolved_api_key = api_key or api_cfg.get("api_key") or os.environ.get("AZURE_OPENAI_API_KEY")
+            resolved_model = model or api_cfg.get("model") or os.environ.get("AZURE_OPENAI_MODEL")
+            endpoint = base_url or api_cfg.get("base_url") or os.environ.get("AZURE_OPENAI_ENDPOINT")
+            if not endpoint:
+                raise RuntimeError("Azure provider selected but no endpoint provided (AZURE_OPENAI_ENDPOINT or settings.api.base_url or base_url arg).")
+            # Normalize to {endpoint}/openai/v1
+            endpoint = endpoint.rstrip("/")
+            if not endpoint.endswith("/openai/v1"):
+                if endpoint.endswith("/openai"):
+                    endpoint = f"{endpoint}/v1"
+                else:
+                    endpoint = f"{endpoint}/openai/v1"
+            resolved_base_url = endpoint
+            if not resolved_api_key:
+                raise RuntimeError("Azure provider selected but no API key provided (AZURE_OPENAI_API_KEY or settings.api.api_key or api_key arg).")
+            if not resolved_model:
+                raise RuntimeError("Azure provider selected but no model deployment provided (AZURE_OPENAI_MODEL or settings.api.model or model arg).")
+            self.session.headers.update({
+                "api-key": resolved_api_key,
                 "Content-Type": "application/json",
-            }
-        )
+            })
+        else:  # openai
+            resolved_api_key = api_key or api_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY")
+            resolved_model = model or api_cfg.get("model") or os.environ.get("AI_MODEL") or "gpt-5"
+            resolved_base_url = base_url or api_cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+            # Ensure /v1 suffix
+            resolved_base_url = resolved_base_url.rstrip("/")
+            if not resolved_base_url.endswith("/v1"):
+                resolved_base_url = f"{resolved_base_url}/v1"
+            if not resolved_api_key:
+                raise RuntimeError("OpenAI provider selected but no API key provided (OPENAI_API_KEY or settings.api.api_key or api_key arg).")
+            self.session.headers.update({
+                "Authorization": f"Bearer {resolved_api_key}",
+                "Content-Type": "application/json",
+            })
+
+        # Finalize
+        self.model = resolved_model  # OpenAI model id or Azure deployment name
+        self.base_url = resolved_base_url
+        self.provider = provider
 
     # orion: Expand docstring and comments; Responses API is the single entry point and supports iterative tool-call handling.
     def call_responses(
@@ -140,7 +215,7 @@ class ChatCompletionsClient:
 
         model = model or self.model
         # orion: Responses endpoint uses /v1/responses with different payload keys than chat.completions.
-        url = f"{self.base_url}/responses"  # /v1/responses
+        url = f"{self.base_url}/responses"  # /v1/responses or /openai/v1/responses
         max_output_tokens = max_completion_tokens or MAX_COMPLETION_TOKENS
 
         # orion: Work on a local copy of messages to append tool outputs and assistant echoes.
@@ -303,7 +378,7 @@ class ChatCompletionsClient:
             # orion: Build payload once per POST so logging captures the exact body sent.
             payload = _make_payload()
 
-            # orion: If logging is enabled, write the request in REST Client format with redacted Authorization.
+            # orion: If logging is enabled, write the request in REST Client format with redacted Authorization/api-key.
             try:
                 http_file = None
                 settings = getattr(ctx, "settings", {}) or {}
@@ -337,7 +412,10 @@ class ChatCompletionsClient:
                         ts_ms = int(time.time() * 1000)
                         http_file_path = base_dir / f"call-{ts_ms}.http"
                         headers_for_log = dict(self.session.headers)
-                        headers_for_log["Authorization"] = "Bearer {{OPENAI_API_KEY}}"
+                        if "Authorization" in headers_for_log:
+                            headers_for_log["Authorization"] = "Bearer {{OPENAI_API_KEY}}"
+                        if "api-key" in headers_for_log:
+                            headers_for_log["api-key"] = "{{AZURE_OPENAI_API_KEY}}"
                         dumpHttpFile(str(http_file_path), url, "POST", headers_for_log, payload)
                         http_file = http_file_path
             except Exception:
