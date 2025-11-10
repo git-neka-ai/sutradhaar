@@ -262,6 +262,7 @@ class Orion:
         ctx.send_to_user(":clear-changes        - Clear all pending changes")
         ctx.send_to_user(":clearChanges         - Alias for :clear-changes")
         ctx.send_to_user(":refresh              - Rescan repo and refresh summaries")
+        ctx.send_to_user(":reset-state         - Refresh summaries and rebuild base system_state")
         ctx.send_to_user(":refresh-deps         - Refresh Project Orion Summaries for external dependencies")
         ctx.send_to_user(":status               - Show status summary")
         ctx.send_to_user(":consolidate          - Coalesce duplicate change batches")
@@ -373,6 +374,45 @@ class Orion:
 
         ensure_all_pos(ctx, self.ext_root, self.client)
         ctx.log("Refreshed external dependency Project Orion Summaries.")
+
+    def cmd_reset_state(self, ctx: Context) -> None:
+        """Rebuild the base system_state from current summaries and rewrite history.
+
+        Steps:
+          - Refresh summaries
+          - Drop all prior system_state messages
+          - Insert a single new summaries-only system_state at the front
+          - Replay the remaining messages in order
+        """
+        # orion: Refresh summaries first to ensure the new system_state reflects the latest repo view.
+        self._refresh_summaries(ctx)
+
+        # Build a fresh summaries-only system_state message.
+        new_state_msg = self._build_system_state_message(ctx)
+
+        # Filter out all prior system_state messages from history, keep other messages as-is.
+        remaining: List[Dict[str, Any]] = []
+        for m in self.history:
+            if m.get("type") == "message" and m.get("role") == "system":
+                try:
+                    content = m.get("content", "")
+                    obj = json.loads(content) if isinstance(content, str) else None
+                    if isinstance(obj, dict) and obj.get("type") == "system_state":
+                        continue
+                except Exception:
+                    pass
+            remaining.append(m)
+
+        # Rewrite stored history: clear, then write new system_state, then replay remaining messages in order.
+        self.storage.clear_history()
+        self.history = []
+        self.storage.append_raw_message(new_state_msg)
+        self.history.append(new_state_msg)
+        for m in remaining:
+            self.storage.append_raw_message(m)
+            self.history.append(m)
+
+        ctx.send_to_user("Reset system_state from summaries and rebuilt conversation history.")
 
     def cmd_status(self, ctx: Context) -> None:
         """Print a one-line-per-field status report about the current Orion session and repo."""
@@ -863,6 +903,8 @@ class Orion:
                 self.cmd_clear_changes(ctx)
             elif cmd == ":refresh":
                 self.cmd_refresh(ctx)
+            elif cmd == ":reset-state":
+                self.cmd_reset_state(ctx)
             elif cmd == ":refresh-deps":
                 self.cmd_refresh_deps(ctx)
             elif cmd == ":status":
