@@ -7,6 +7,7 @@ import sys
 
 import json
 import pathlib
+import time
 from typing import Any, Dict, List, Optional
 
 from .config import LINE_CAP
@@ -274,6 +275,7 @@ class Orion:
         ctx.send_to_user(":discard-change <id>  - Discard a pending change by id")
         # orion: Update help text to include :history and both clear commands (:clear-changes and alias :clearChanges) for discoverability.
         ctx.send_to_user(":history              - Show last 10 user↔assistant turns from history")
+        ctx.send_to_user(":previousConversation - Show last 10 archived conversations (oldest→newest)")
         # orion: Add :rerun to replay the most recent user message without adding a duplicate user entry.
         ctx.send_to_user(":rerun                - Rerun the last user message without duplicating it")
         ctx.send_to_user(":clear-changes        - Clear all pending changes")
@@ -283,12 +285,15 @@ class Orion:
         ctx.send_to_user(":refresh-deps         - Refresh Project Orion Summaries for external dependencies")
         ctx.send_to_user(":status               - Show status summary")
         ctx.send_to_user(":consolidate          - Coalesce duplicate change batches")
-        ctx.send_to_user(":help                 - Show this help")
-        ctx.send_to_user(":quit                 - Exit")
         # orion: Document per-turn model override directive; parsed before command routing and applied only to the next conversation call.
         ctx.send_to_user(":model <model> <message> - Use model for only this turn")
         # orion: Remove token counting command; keep ad-hoc file splitting only.
         ctx.send_to_user(":splitFile <path>     - Split a file via model-assisted refactor and write results immediately")
+        # orion: Add TODO CLI commands.
+        ctx.send_to_user(":todo list            - List TODOs as [id] status text")
+        ctx.send_to_user(":todo add <text>      - Add a new TODO")
+        ctx.send_to_user(":todo done <id>       - Mark a TODO as done")
+        ctx.send_to_user(":todo rm <id>         - Remove a TODO by id")
 
     def cmd_preview(self, ctx: Context) -> None:
         """Display all pending change specs in a human-readable format."""
@@ -449,6 +454,15 @@ class Orion:
         ctx.send_to_user(f"Tracked digests: {len(self.md.get('path_to_digest', {}))}")
         if self.ext_root:
             ctx.send_to_user(f"External PD root: {self.ext_root} (flat). PD files: {dep_count}")
+        # orion: Show TODO counts.
+        try:
+            res = run_tool(ctx, "list_todos", {})
+            items = (res.get("result") or {}).get("items", [])
+            open_count = sum(1 for it in items if (it.get("status") or "open").lower() == "open")
+            done_count = sum(1 for it in items if (it.get("status") or "open").lower() == "done")
+            ctx.send_to_user(f"TODOs: {open_count} open, {done_count} done")
+        except Exception:
+            ctx.send_to_user("TODOs: unavailable")
         ctx.send_to_user(f"Archived conversations: {len(self.md.get('conversation_archives', []))}")
 
     def cmd_consolidate(self, ctx: Context) -> None:
@@ -555,11 +569,14 @@ class Orion:
             return
         last = turns[-max_turns:]
         ctx.send_to_user(f"Last {len(last)} turn(s):")
-        for u, a in last:
+        for idx, (u, a) in enumerate(last):
             if u is not None:
                 ctx.send_to_user(f"User: {u}")
             if a is not None:
                 ctx.send_to_user(f"Assistant: {a}")
+            # orion: Insert exactly one blank line between turns (none after the last).
+            if idx != len(last) - 1:
+                ctx.send_to_user("")
 
     # orion: Implement :rerun to resend the most recent user message without duplicating it in history.
     # It rebuilds the message list up to and including that user turn, excluding any later assistant/tool outputs.
@@ -980,6 +997,92 @@ class Orion:
 
         # orion: Removed post-apply LINE_CAP auto-splitting; users can now run :splitFile when desired.
 
+    # orion: New command printing the last 10 archived conversations with local timestamps and summaries.
+    def cmd_previous_conversation(self, ctx: Context) -> None:
+        """Print the last 10 archived conversations (oldest→newest) with id, local time, and summary."""
+        archives = self.md.get("conversation_archives", [])
+        if not archives:
+            ctx.send_to_user("No archived conversations.")
+            return
+        last = archives[-10:]
+        ctx.send_to_user(f"Last {len(last)} archived conversation(s):")
+        for idx, a in enumerate(last):
+            try:
+                ts_val = float(a.get("ts", 0.0) or 0.0)
+                ts_local = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_val)) if ts_val > 0 else "unknown"
+            except Exception:
+                ts_local = "unknown"
+            conv_id = str(a.get("id", ""))
+            summary = str(a.get("s", ""))
+            ctx.send_to_user(f"{conv_id} | {ts_local}")
+            ctx.send_to_user(summary)
+            # orion: Separate entries by two blank lines (none after the last).
+            if idx != len(last) - 1:
+                ctx.send_to_user("")
+                ctx.send_to_user("")
+
+    # orion: TODO CLI command using internal tools for storage
+    def cmd_todo(self, ctx: Context, parts: List[str]) -> None:
+        if len(parts) < 2:
+            ctx.error_message("Usage: :todo <list|add|done|rm> [args]")
+            return
+        sub = parts[1]
+        if sub == "list":
+            res = run_tool(ctx, "list_todos", {})
+            payload = res.get("result", {})
+            items = payload.get("items", [])
+            if not items:
+                ctx.send_to_user("No TODOs.")
+                return
+            for it in items:
+                ctx.send_to_user(f"[{it.get('id')}] {it.get('status')} {it.get('text')}")
+            return
+        if sub == "add":
+            if len(parts) < 3:
+                ctx.error_message("Usage: :todo add <text>")
+                return
+            text = " ".join(parts[2:]).strip()
+            res = run_tool(ctx, "add_todo", {"text": text})
+            payload = res.get("result", {})
+            if "_meta_error" in payload:
+                ctx.error_message(payload["_meta_error"])
+                return
+            ctx.send_to_user(f"Added [{payload.get('id')}] {payload.get('text')}")
+            return
+        if sub == "done":
+            if len(parts) < 3:
+                ctx.error_message("Usage: :todo done <id>")
+                return
+            try:
+                tid = int(parts[2])
+            except Exception:
+                ctx.error_message("Invalid id")
+                return
+            res = run_tool(ctx, "set_todo_status", {"id": tid, "status": "done"})
+            payload = res.get("result", {})
+            if "_meta_error" in payload:
+                ctx.error_message(payload["_meta_error"])
+                return
+            ctx.send_to_user(f"Marked [{tid}] done.")
+            return
+        if sub == "rm":
+            if len(parts) < 3:
+                ctx.error_message("Usage: :todo rm <id>")
+                return
+            try:
+                tid = int(parts[2])
+            except Exception:
+                ctx.error_message("Invalid id")
+                return
+            res = run_tool(ctx, "remove_todo", {"id": tid})
+            payload = res.get("result", {})
+            if "_meta_error" in payload:
+                ctx.error_message(payload["_meta_error"])
+                return
+            ctx.send_to_user(f"Removed [{tid}].")
+            return
+        ctx.error_message("Unknown :todo subcommand. Use list|add|done|rm.")
+
     def handle_user_input(self, ctx: Context, text: str) -> None:
         """
         Handle a line of user input: either execute a command or advance the conversation.
@@ -1017,6 +1120,8 @@ class Orion:
             # orion: Route :history to new cmd_history for compact display of last user↔assistant turns.
             elif cmd == ":history":
                 self.cmd_history(ctx)
+            elif cmd == ":previousConversation":
+                self.cmd_previous_conversation(ctx)
             # orion: Wire :rerun to replay the most recent user message without creating a duplicate entry.
             elif cmd == ":rerun":
                 self.cmd_rerun(ctx)
@@ -1039,6 +1144,9 @@ class Orion:
                     ctx.error_message("Usage: :splitFile <path>")
                 else:
                     self.cmd_split_file(ctx, parts[1])
+            # orion: TODO command
+            elif cmd == ":todo":
+                self.cmd_todo(ctx, parts)
             elif cmd == ":quit":
                 ctx.send_to_user("Goodbye.")
                 import sys

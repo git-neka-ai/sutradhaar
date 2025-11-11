@@ -17,6 +17,9 @@ import time
 import random
 # orion: Import os for environment-based provider detection and secrets.
 import os
+# orion: Add HTTPAdapter + Retry for HTTPS-level retries on idempotent and POST calls per hardening plan.
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # orion: Introduce a centralized OpenAI schema preprocessor that (1) removes sibling keys alongside $ref and (2) enforces strict object-shape requirements by ensuring required includes all property keys and additionalProperties=False for any node with properties.
 
@@ -164,6 +167,44 @@ class ChatCompletionsClient:
         self.model = resolved_model  # OpenAI model id or Azure deployment name
         self.base_url = resolved_base_url
         self.provider = provider
+
+        # orion: Mount HTTPS adapter with Retry for 429 and 5xx to absorb transient upstream failures.
+        self._mount_https_retry_adapter()
+
+    # orion: HTTPS adapter mounting with conservative Retry to complement the outer manual retry loop.
+    def _mount_https_retry_adapter(self) -> None:
+        try:
+            retries = Retry(
+                total=3,
+                connect=3,
+                read=3,
+                status=3,
+                backoff_factor=0.5,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=frozenset(["GET", "POST"]),
+                respect_retry_after_header=True,
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retries)
+            self.session.mount("https://", adapter)
+        except Exception:
+            # Best-effort; do not fail initialization if urllib3 Retry is unavailable.
+            pass
+
+    # orion: Rebuild the requests Session to refresh TLS sockets while preserving headers and HTTPS retries.
+    def _rebuild_session(self) -> None:
+        try:
+            headers = dict(self.session.headers)
+        except Exception:
+            headers = {}
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = requests.Session()
+        if headers:
+            self.session.headers.update(headers)
+        self._mount_https_retry_adapter()
 
     # orion: Expand docstring and comments; Responses API is the single entry point and supports iterative tool-call handling.
     def call_responses(
@@ -374,6 +415,24 @@ class ChatCompletionsClient:
                 # Best-effort logging; never fail the request loop
                 pass
 
+        # orion: Append exception details to the .httpcalls log when a request fails before an HTTP response exists.
+        def _append_http_exception_log(http_file: Optional[pathlib.Path], elapsed_ms: int, exc: Exception) -> None:
+            if http_file is None:
+                return
+            try:
+                with open(http_file, "a", encoding="utf-8") as f:
+                    f.write("\n\n### Exception — elapsed_ms: " + str(elapsed_ms) + "\n")
+                    f.write(type(exc).__name__ + ": " + str(exc) + "\n")
+            except Exception:
+                pass
+
+        # orion: Convert int/float timeout to (connect, read) tuple; pass tuples through unchanged.
+        def _normalize_timeout(val: Any) -> Any:
+            # orion: Use a conservative 10s connect timeout by default when caller provides a single scalar.
+            if isinstance(val, (int, float)):
+                return (10, val)
+            return val
+
         while True:
             # orion: Build payload once per POST so logging captures the exact body sent.
             payload = _make_payload()
@@ -422,7 +481,7 @@ class ChatCompletionsClient:
                 http_file = None  # Non-fatal: proceed without logging
 
             # orion: Conservative timeout to accommodate tool loops; Responses may stream chunks server-side.
-            # orion: Wrap the POST in a bounded retry loop for transient failures (timeouts, HTTP 5xx). 4xx errors are not retried.
+            # orion: Wrap the POST in a bounded retry loop for transient failures (timeouts, HTTP 5xx, TLS/connection errors). 4xx errors are not retried.
             max_retries = 3
             attempt = 0
             last_exc: Optional[Exception] = None
@@ -431,7 +490,14 @@ class ChatCompletionsClient:
                 attempt += 1
                 t0 = time.time()
                 try:
-                    r = self.session.post(url, json=payload, timeout=_timeout)
+                    # orion: From attempt ≥2, hint the server/proxies to close the socket to avoid reusing a bad connection.
+                    req_headers = {"Connection": "close"} if attempt >= 2 else None
+                    r = self.session.post(
+                        url,
+                        json=payload,
+                        timeout=_normalize_timeout(_timeout),
+                        headers=req_headers,
+                    )
                     elapsed_ms = int((time.time() - t0) * 1000)
 
                     # orion: Append a response section to the same .http file with status, headers, body, and elapsed time (non-fatal on errors).
@@ -473,6 +539,8 @@ class ChatCompletionsClient:
                         raise RuntimeError(f"Responses API error {r.status_code}: {r.text[:2000]}")
                 except requests.exceptions.Timeout as e:
                     last_exc = e
+                    elapsed_ms = int((time.time() - t0) * 1000)
+                    _append_http_exception_log(http_file, elapsed_ms, e)
                     if attempt <= max_retries:
                         base_delay = [1.0, 2.0, 4.0][min(attempt - 1, 2)]
                         delay = base_delay * random.uniform(0.5, 1.5)
@@ -484,6 +552,25 @@ class ChatCompletionsClient:
                         continue
                     # Retries exhausted
                     raise RuntimeError(f"Responses API timeout after {attempt} attempt(s): {e}")
+                except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+                    # orion: Treat TLS/connection errors as transient: log, refresh TLS by rebuilding the Session, and retry.
+                    last_exc = e
+                    elapsed_ms = int((time.time() - t0) * 1000)
+                    _append_http_exception_log(http_file, elapsed_ms, e)
+                    if attempt <= max_retries:
+                        try:
+                            ctx.log(f"Responses API {type(e).__name__} on attempt {attempt}; rebuilding session and retrying...")
+                        except Exception:
+                            pass
+                        try:
+                            self._rebuild_session()
+                        except Exception:
+                            pass
+                        base_delay = [1.0, 2.0, 4.0][min(attempt - 1, 2)]
+                        delay = base_delay * random.uniform(0.5, 1.5)
+                        time.sleep(delay)
+                        continue
+                    raise RuntimeError(f"Responses API connection error after {attempt} attempt(s): {e}")
                 # Exit inner retry loop on success
                 break
 

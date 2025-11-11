@@ -6,7 +6,8 @@ import pathlib
 from typing import Any, Dict, List, Optional, Callable, get_type_hints
 
 from .context import Context
-from .fs import list_repo_paths, normalize_path, read_file, count_lines, read_json, read_jsonl
+from .fs import list_repo_paths, normalize_path, read_file, count_lines, read_json, read_jsonl, write_file, now_ts
+import yaml
 
 # -----------------------------
 # Reflection utilities and registry
@@ -234,3 +235,112 @@ def get_archived_conversation_details(ctx: Context, id: str) -> Dict[str, Any]:
             "content": row.get("content", ""),
         })
     return {"id": rec.get("id"), "filename": filename, "records": records}
+
+
+# -----------------------------
+# TODO list tools (YAML-backed)
+# -----------------------------
+
+_TODO_REL_PATH = ".orion/orion-todolist.yaml"
+
+
+def _todo_dir(ctx: Context) -> pathlib.Path:
+    return (ctx.repo_root / ".orion").resolve()
+
+
+def _load_todos(ctx: Context) -> List[Dict[str, Any]]:
+    try:
+        text = read_file(ctx.repo_root, _TODO_REL_PATH)
+    except Exception:
+        return []
+    try:
+        data = yaml.safe_load(text)
+    except Exception:
+        data = None
+    if not isinstance(data, list):
+        return []
+    # Normalize items
+    out: List[Dict[str, Any]] = []
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        tid = it.get("id")
+        txt = it.get("text")
+        st = it.get("status") or "open"
+        ts = it.get("ts")
+        dts = it.get("done_ts") if "done_ts" in it else None
+        try:
+            tid = int(tid)
+        except Exception:
+            continue
+        out.append({"id": tid, "text": str(txt or ""), "status": str(st), "ts": ts, "done_ts": dts})
+    return out
+
+
+def _save_todos(ctx: Context, items: List[Dict[str, Any]]) -> None:
+    # orion: Ensure .orion directory exists before write.
+    _todo_dir(ctx).mkdir(parents=True, exist_ok=True)
+    dump = yaml.safe_dump(items, sort_keys=False, allow_unicode=True)
+    write_file(ctx.repo_root, _TODO_REL_PATH, dump)
+
+
+@tool(name="list_todos", description="List TODO items from .orion/orion-todolist.yaml; optionally filter by status ('open' or 'done').")
+def list_todos(ctx: Context, status: Optional[str] = None) -> Dict[str, Any]:
+    items = _load_todos(ctx)
+    if status:
+        s = str(status).strip().lower()
+        items = [it for it in items if it.get("status", "open").lower() == s]
+    # Return compact view
+    return {"items": [{"id": it["id"], "text": it["text"], "status": it.get("status", "open")} for it in items]}
+
+
+@tool(name="add_todo", description="Add a TODO with the given text; assigns next numeric id and persists.")
+def add_todo(ctx: Context, text: str) -> Dict[str, Any]:
+    txt = (text or "").strip()
+    if not txt:
+        return {"_meta_error": "text required"}
+    items = _load_todos(ctx)
+    next_id = 1 + max((it["id"] for it in items), default=0)
+    now = now_ts()
+    rec = {"id": next_id, "text": txt, "status": "open", "ts": now, "done_ts": None}
+    items.append(rec)
+    _save_todos(ctx, items)
+    return {"id": next_id, "text": txt, "status": "open"}
+
+
+@tool(name="set_todo_status", description="Update status for a TODO id to 'open' or 'done'.")
+def set_todo_status(ctx: Context, id: int, status: str) -> Dict[str, Any]:
+    try:
+        tid = int(id)
+    except Exception:
+        return {"_meta_error": "invalid id"}
+    st = str(status or "").strip().lower()
+    if st not in ("open", "done"):
+        return {"_meta_error": "invalid status"}
+    items = _load_todos(ctx)
+    found = False
+    now = now_ts()
+    for it in items:
+        if it.get("id") == tid:
+            it["status"] = st
+            it["done_ts"] = now if st == "done" else None
+            found = True
+            break
+    if not found:
+        return {"_meta_error": "todo id not found"}
+    _save_todos(ctx, items)
+    return {"id": tid, "status": st}
+
+
+@tool(name="remove_todo", description="Remove a TODO item by id.")
+def remove_todo(ctx: Context, id: int) -> Dict[str, Any]:
+    try:
+        tid = int(id)
+    except Exception:
+        return {"_meta_error": "invalid id"}
+    items = _load_todos(ctx)
+    new_items = [it for it in items if it.get("id") != tid]
+    if len(new_items) == len(items):
+        return {"_meta_error": "todo id not found"}
+    _save_todos(ctx, new_items)
+    return {"id": tid, "removed": True}

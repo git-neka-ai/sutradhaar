@@ -8,3 +8,5 @@
 - To modify an existing ChangeSpec, return one with the same id and updated fields; Orion will replace the existing spec with your version.
 - To delete an existing ChangeSpec, return one with the same id and set items: [] (an empty array).
 - Any ChangeSpec with a new id will be appended.
+- For remembering or tracking tasks across turns, manage TODOs via the dedicated tools: list_todos, add_todo, set_todo_status, remove_todo. Do not assume TODOs are present in system_state; they are stored only in .orion/orion-todolist.yaml and must be read/written via tools.
+- Before adding a TODO, call list_todos to avoid duplicates; prefer updating status with set_todo_status when appropriate.
