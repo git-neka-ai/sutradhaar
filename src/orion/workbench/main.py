@@ -39,6 +39,7 @@ from .models import (
     ChangeItem,
     InfoSummary,
 )
+import yaml
 
 
 # -----------------------------
@@ -221,12 +222,32 @@ class Orion:
         }
         # Pending changes: expose current list so the model can consult/modify them per turn
         pending_changes = self.md.get("pending_changes", []) if isinstance(self.md, dict) else []
+
+        # Downloads: include only names to allow discovery without inlining contents
+        downloads_names: List[str] = []
+        try:
+            text = read_file(self.repo_root, ".orion/downloads.yaml")
+            try:
+                data = yaml.safe_load(text)
+            except Exception:
+                data = None
+            if isinstance(data, list):
+                for it in data:
+                    if isinstance(it, dict):
+                        nm = it.get("name")
+                        if isinstance(nm, str) and nm.strip():
+                            downloads_names.append(nm.strip())
+        except Exception:
+            # orion: Missing or unreadable downloads.yaml is treated as no downloads.
+            pass
+
         payload: Dict[str, Any] = {
             "type": "system_state",
             "version": 1,
             "files": files_map,
             "conversations": conv_obj,
             "pending_changes": pending_changes,
+            "downloads": {"names": downloads_names},
         }
         return {"type": "message", "role": "system", "content": json.dumps(payload, ensure_ascii=False)}
 
